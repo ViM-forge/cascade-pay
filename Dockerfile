@@ -9,8 +9,11 @@ COPY pyproject.toml poetry.lock ./
 RUN poetry sync --no-root
 COPY src ./src
 COPY alembic ./alembic
+COPY mock_alembic ./mock_alembic
+COPY mock_alembic.ini ./mock_alembic.ini
 COPY alembic.ini ./
 COPY tests ./tests
+COPY scripts ./scripts
 RUN poetry install --only-root && useradd --create-home app && chown -R app:app /app
 USER app
 CMD ["gunicorn", "payments.presentation.app:app", "--bind", "0.0.0.0:8000", "--workers", "2", "--worker-class", "uvicorn_worker.UvicornWorker", "--graceful-timeout", "10"]

@@ -11,7 +11,8 @@ def config():
         database_url="postgresql+asyncpg://user:password@localhost/payments",
         redis_url="redis://localhost:6379/0",
         jwt_secret="s" * 40,
-        mock_service_credential="m" * 40,
+        mock_a_service_credential="a" * 40,
+        mock_b_service_credential="b" * 40,
         merchant_ids=(uuid4(), uuid4()),
     )
 
@@ -36,7 +37,9 @@ def test_load_dotenv(tmp_path, monkeypatch):
         {"database_url": "sqlite:///test"},
         {"redis_url": "http://localhost"},
         {"jwt_secret": "placeholder"},
-        {"mock_service_credential": ""},
+        {"mock_a_service_credential": ""},
+        {"mock_b_service_credential": ""},
+        {"mock_b_service_credential": "a" * 40},
         {"provider_a_url": "ftp://localhost"},
     ],
 )
@@ -46,7 +49,7 @@ def test_invalid_config(patch):
 
 
 def test_missing_secret_and_safe_error(monkeypatch):
-    for key in ("JWT_SECRET", "MOCK_SERVICE_CREDENTIAL"):
+    for key in ("JWT_SECRET", "MOCK_A_SERVICE_CREDENTIAL", "MOCK_B_SERVICE_CREDENTIAL"):
         monkeypatch.delenv(key, raising=False)
     values = config()
     values.pop("jwt_secret")

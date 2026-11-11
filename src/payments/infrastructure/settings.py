@@ -8,12 +8,19 @@ from sqlalchemy.engine import make_url
 
 
 class Settings(BaseSettings):
+    """Payment-process settings; provider credentials are scoped separately to A/B.
+
+    Compose passes each mock only its own credential as MOCK_SERVICE_CREDENTIAL.
+    Sharing a service credential would let a caller authenticated for A access B.
+    """
+
     model_config = SettingsConfigDict(extra="ignore", hide_input_in_errors=True)
 
     database_url: SecretStr
     redis_url: SecretStr
     jwt_secret: SecretStr
-    mock_service_credential: SecretStr
+    mock_a_service_credential: SecretStr
+    mock_b_service_credential: SecretStr
     merchant_ids: tuple[UUID, UUID]
     jwt_issuer: str = Field(default="payments-demo", min_length=1)
     jwt_audience: str = Field(default="payments-api", min_length=1)
@@ -27,7 +34,7 @@ class Settings(BaseSettings):
     reconciliation_max_checks: int = Field(default=5, gt=0, le=5)
     safe_retry_seconds: float = Field(default=86400, gt=0, le=86400)
 
-    @field_validator("jwt_secret", "mock_service_credential")
+    @field_validator("jwt_secret", "mock_a_service_credential", "mock_b_service_credential")
     @classmethod
     def strong_secret(cls, value: SecretStr) -> SecretStr:
         raw = value.get_secret_value()
@@ -75,6 +82,8 @@ class Settings(BaseSettings):
             raise ValueError("two HTTP calls must fit within lease")
         if self.recovery_interval_seconds >= self.lease_seconds:
             raise ValueError("recovery interval must be shorter than lease")
+        if self.mock_a_service_credential == self.mock_b_service_credential:
+            raise ValueError("provider service credentials must differ")
         if len(set(self.merchant_ids)) != 2:
             raise ValueError("two distinct merchant UUIDs required")
         return self

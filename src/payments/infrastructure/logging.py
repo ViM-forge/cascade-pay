@@ -11,6 +11,11 @@ class JsonFormatter(logging.Formatter):
                 "logger": record.name,
                 "event": getattr(record, "event", "runtime"),
                 "pid": record.process,
+                **{
+                    k: getattr(record, k)
+                    for k in ("payment_id", "attempt_id", "provider", "duration", "result")
+                    if hasattr(record, k)
+                },
             }
         )
 

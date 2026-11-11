@@ -1,6 +1,6 @@
 # HTTP-контракт mock-провайдеров A и B
 
-Статус: спецификация для реализации, не отчёт о пройденных тестах. Локальные переходы описаны в [decisions.md](decisions.md), проверки — в [acceptance.md](acceptance.md).
+Статус: нормативная спецификация. Реализованы success/lookup, долговечная идемпотентность, success fixtures и stats. Остальные fixture modes, resolve и barriers ещё не реализованы; это будущий объём. Фактические проверки — в [verification.md](verification.md). Локальные переходы описаны в [decisions.md](decisions.md), проверки — в [acceptance.md](acceptance.md).
 
 ## Изоляция и долговечность
 
