@@ -1,0 +1,79 @@
+# Критерии приёмки и будущие проверки
+
+Статус: контракт проверки. На документальном этапе ниже ничего не объявлено пройденным; тесты, CLI и приложение ещё не созданы. Указанные test IDs — обязательные будущие имена; менять их можно только вместе с этой матрицей. Нормативные [решения](decisions.md) и [HTTP provider contract](provider-contract.md) самодостаточны.
+
+## Метод доказательства
+
+Unit проверяет переходы и часы; integration/e2e использует настоящие PostgreSQL, Redis/Taskiq и HTTP без подмены repository/provider. CLI получает свежий merchant JWT, использует уникальные key/ref, polling с общим timeout и завершается ненулевым кодом при провале assertion. Число списаний берётся из устойчивого provider ledger через HTTP stats, не из статуса payment; create_calls и lookup_calls отдельны. A/B счётчики проверяются по ref текущего сценария. Барьеры/failpoints детерминируют порядок вместо случайных sleep. Обычный restart сохраняет volumes. Нагрузочная проверка не обещана.
+
+## Шесть демонстраций
+
+Команды — целевой интерфейс после реализации, из корня после подготовки окружения по будущему README. Здесь они не запускались.
+
+| ID / сценарий / будущая команда | Контракт и ожидаемый результат | Будущий тест |
+|---|---|---|
+| D1 A success; `docker compose --profile demo run --rm demo first-success` | POST 202; GET succeeded; одна A succeeded с external_id; A ledger_count=1 и ledger_amount_minor=amount, B create_calls=0 | `tests/integration/test_first_payment.py::test_first_success` |
+| D2 A decline → B success; `docker compose --profile demo run --rm demo cascade-success` | A declined_retryable/issuer_unavailable сохранён до создания B; GET succeeded, sequence 1/2; ledger A/B=0/1 | `tests/integration/test_cascade.py::test_retryable_then_success` |
+| D3 оба decline; `docker compose --profile demo run --rm demo all-declined` | два подтверждённых retryable отказа; GET failed, ровно две declined, ledger 0/0; нет третьей попытки | `tests/integration/test_cascade.py::test_all_declined` |
+| D4 списание и потеря ответа; `docker compose --profile demo run --rm demo lost-response` | Реальный разрыв после provider commit; наблюдаемый unknown, external_id=NULL; lookup по key → succeeded; A ledger=1, B create_calls=0 | `tests/integration/test_unknown.py::test_charge_then_disconnect` |
+| D5 повтор клиента/задачи; `docker compose --profile demo run --rm demo duplicate-delivery` | 10 одинаковых конкурентных POST → один UUID/202; настоящие дубли Taskiq до/во время/после HTTP; одна A, ledger=1, B calls=0 | `tests/integration/test_concurrency.py::test_duplicate_delivery` |
+| D6 restart; `sh scripts/demo-recovery.sh` | Wrapper останавливает реальный worker на barrier после списания до result commit, перезапускает с теми же данными. Без нового POST тот же payment/attempt/key → succeeded, ledger=1 | `tests/integration/test_recovery.py::test_restart_after_charge` |
+
+D4/D6 обязаны показывать достигнутую промежуточную точку, а не только быстрый succeeded. D5 публикует существующий payment_id через Taskiq, не вызывает handler напрямую. CLI выводит UUID, статус и агрегаты без токенов/секретов/ref. Не требует ручного SQL или скрытой подготовки.
+
+## Шесть вопросов корректности
+
+| ID / вопрос | Нормативное решение, поле/контракт | Будущая проверка и наблюдение |
+|---|---|---|
+| Q1 Потерян external_id | Provider lookup по key; key=UUID attempt сохраняется до HTTP, external_id nullable | D4; `test_unknown.py::test_lookup_without_external_id`: списание найдено, B=0 |
+| Q2 Одновременно worker/recovery | Decisions: lock payment → attempt, lease_until/claim_version, commit до HTTP, условное сохранение ответа | `test_concurrency.py::test_active_lease_noop`, `test_recovery.py::test_stale_owner`: дубли не вызывают HTTP; поздний ответ не меняет состояние |
+| Q3 Когда разрешён каскад | Таблица результатов decisions; provider финальный отказ исключает позднее списание | D2/D3; `test_cascade.py::test_terminal_decline`, `test_unknown.py::test_lookup_final_decline`: B только после retryable/not_charged_final |
+| Q4 Когда допустим повтор | Неизменные payload/key, safe_retry_until=attempt created_at+24ч; provider хранит ключи весь срок данных | `test_unknown.py::test_not_found_same_key`, `tests/unit/test_reconciliation_limits.py::test_safe_retry_boundary`: до окна прежний key; на границе/после — charge=0 |
+| Q5 Как остановить сверку | Persisted check_count/deadline/next_check_at/manual_review_required; неизвестность не failed | `test_unknown.py::test_manual_review`, `test_fault_matrix.py::test_limits_survive_restart`: не более 5 циклов; unknown/manual; Redis/restart не оживляет |
+| Q6 Чем доказано списание | Отдельные provider DB, UNIQUE(key), UNIQUE(operation_id), atomic operation/ledger, защищённый HTTP stats | `test_idempotency.py::test_mock_race_and_restart`: конкурентный charge и restart → тот же external_id, ledger=1; D1–D6 |
+
+Пути test_*.py без префикса в этой таблице относятся к `tests/integration/`.
+
+## Дополнительные гарантии и границы сбоев
+
+Все строки ниже — будущие проверки, не текущие результаты.
+
+| ID | Будущий test ID (каталог tests/integration/, если не указано иное) | Требуемый результат |
+|---|---|---|
+| G1 | `test_unknown.py::test_ambiguous_results` (timeout/pending/5xx/malformed/неожиданный 4xx/неизвестный code/неверный envelope) | unknown, никакого B; исчерпание не превращает в failed |
+| G2 | `test_unknown.py::test_temporary_not_found` | Даже если lookup скрывает списание, повтор charge тем же key даёт ledger=1; новый key/attempt не появляется |
+| G3 | `test_idempotency.py::test_payload_conflict` / `test_merchant_scope` | Другие данные под merchant/key →409, включая гонку; другой merchant с тем же key →другой payment |
+| G4 | `test_concurrency.py::test_duplicate_cascade` | Дубли перехода A→B не создают третью attempt, B ledger<=1 |
+| G5 | `test_recovery.py::test_outbox_commit_before_publish` | Сбой после payment/outbox commit, до publish: без нового POST восстановление исходного ID |
+| G6 | `test_recovery.py::test_publish_before_mark` | Сбой после публикации до published_at: допустим дубль сообщения, ledger=1 |
+| G7 | `test_recovery.py::test_redis_loss_after_published` | Утрата Redis после published_at, PostgreSQL сохранён: recovery ставит задачу заново; тот же payment/attempt/key, ledger=1 |
+| G8 | `test_recovery.py::test_claim_before_http` | Crash после claim до HTTP: expired lease → lookup, при not_found повтор старого key в окне; ledger=1 |
+| G9 | `test_recovery.py::test_stale_owner` | Ответ с прежней version или истёкшим lease не меняет состояние; новый lookup сохраняет канонический исход |
+| G10 | `test_fault_matrix.py::test_manual_stays_stopped` | unknown/manual после restart Redis/worker/dispatcher остаётся без HTTP; next_check_at=NULL |
+| G11 | `test_auth.py::test_jwt_validation` / `test_merchant_isolation` | Нет/неверный/просроченный JWT, issuer/audience/claims/algorithm/sub →401; чужой ID →404; секреты не выходят в ответ/лог |
+| G12 | `test_validation.py::test_strict_inputs` | Граничные входы согласно decisions, сохранение допустимого максимума в настоящей БД без переполнения; недопустимое →422 без payment/outbox |
+| G13 | `test_provider_contract.py::test_final_records_immutable` | Повторы и смена fixture не меняют success/decline/tombstone, после разрешённого отказа ledger=0 навсегда; разные payload →409 |
+| G14 | `test_fault_matrix.py::test_combined_failures` | Конкурентные POST + дубли Taskiq + задержанный ответ + recovery: один payment, нет B до финального разрешения, ledger=1 |
+| G15 | `tests/unit/test_domain.py::test_terminal_cannot_be_overwritten` | Нельзя заменить succeeded/declined поздним результатом; проверка без ORM/HTTP |
+
+### Последняя сверка и транспорт: обязательные граничные тесты
+
+Все IDs в `tests/integration/test_fault_matrix.py`, кроме явно указанного unit.
+
+| ID / будущий тест | Управляемая граница и ожидаемый результат |
+|---|---|
+| G16 `test_fifth_check_crash_before_http` | Зафиксировать count=5 и lease, убить worker до HTTP; до истечения lease no-op, после — unknown/manual, lease=NULL, next=NULL, version увеличена. Lookup шестой раз не выполняется; запись больше не застревает в due-выборке |
+| G17 `test_fifth_check_owner_success` | При count=5 пятый владелец получает success и коммитит до конца lease; конкурирующий recovery, включая наступивший deadline, не мешает succeeded; ledger=1 |
+| G18 `test_fifth_check_owner_unknown` | Пятый владелец сохраняет pending/error/not_found без разрешённого результата →unknown/manual; дальнейшего HTTP нет |
+| G19 `test_fifth_check_expired_response` | Count=5, lease истёк; ответ прежнего владельца, даже до запуска recovery, отвергается; recovery включает manual без шестого lookup |
+| G20 `test_deadline_owner_and_new_claim` | Действующий владелец сохраняет финал после deadline до lease expiry; новый владелец при now>=deadline не получает claim, даже если count<5 |
+| G21 `test_stream_redelivery_without_new_messages` | Изолировать DB recovery, убить consumer до ACK, оставить stream без новых публикаций; periodic reclaim возвращает исходное сообщение другому consumer и после обработки снимает pending. Отдельно crash после DB commit до ACK →дубль без второго списания |
+| G22 `tests/unit/test_reconciliation_limits.py::test_backoff_and_boundaries` | 1с до первой, затем 2/4/8/16с от результата; due=min(backoff,deadline). На lease/deadline/window равенство уже истечение; crash не сбрасывает count/deadline/window |
+
+G12 включает: 1 и BIGINT max проходят API/БД/provider без потери точности; 0, -1, max+1, true, 1.0, 1e0, "1", null →422; ref 1/255 символов принят, 0/256/whitespace/control/non-string отвергнут; лишние поля запрещены; usd нормализуется в USD и повтор даёт тот же id. Не менять ref и проверять 255 Unicode-кодовых точек, а не байт.
+
+G21 проверяет именно транспорт при отключённом recovery; G7 — восстановление из PostgreSQL при утрате Redis. Один тест не заменяет другой.
+
+## Статус текущей проверки
+
+На этом этапе допускается только документальная приёмка: ручной проход переходов, согласованность полей/таймингов, наличие покрытия D1–D6/Q1–Q6, проверка ссылок, состава Git и отсутствия секретов. Выполнение pytest, Ruff, Compose и шести команд будет подтверждаться отдельно после реализации. Защита от повторного списания условна относительно provider contract и сохранности PostgreSQL; exactly-once транспорт, реальный процессинг, SLA и нагрузка не доказаны.
