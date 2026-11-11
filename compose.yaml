@@ -1,0 +1,102 @@
+x-app: &app
+  build: .
+  image: cascade-payments:local
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://payments:${PAYMENTS_DB_PASSWORD:?generate secrets in .env}@postgres:5432/payments
+    REDIS_URL: redis://redis:6379/0
+    PROVIDER_A_URL: http://mock-a:8000
+    PROVIDER_B_URL: http://mock-b:8000
+    JWT_SECRET: ${JWT_SECRET:?required in .env}
+    MOCK_SERVICE_CREDENTIAL: ${MOCK_SERVICE_CREDENTIAL:?required in .env}
+    MERCHANT_IDS: ${MERCHANT_IDS:?required in .env}
+    JWT_ISSUER: ${JWT_ISSUER:?required in .env}
+    JWT_AUDIENCE: ${JWT_AUDIENCE:?required in .env}
+    JWT_TTL_SECONDS: ${JWT_TTL_SECONDS:?required in .env}
+    HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:?required in .env}
+    LEASE_SECONDS: ${LEASE_SECONDS:?required in .env}
+    RECOVERY_INTERVAL_SECONDS: ${RECOVERY_INTERVAL_SECONDS:?required in .env}
+    RECONCILIATION_DEADLINE_SECONDS: ${RECONCILIATION_DEADLINE_SECONDS:?required in .env}
+    RECONCILIATION_MAX_CHECKS: ${RECONCILIATION_MAX_CHECKS:?required in .env}
+    SAFE_RETRY_SECONDS: ${SAFE_RETRY_SECONDS:?required in .env}
+  stop_grace_period: 20s
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?generate secrets in .env}
+      PAYMENTS_DB_PASSWORD: ${PAYMENTS_DB_PASSWORD:?generate secrets in .env}
+      MOCK_A_DB_PASSWORD: ${MOCK_A_DB_PASSWORD:?generate secrets in .env}
+      MOCK_B_DB_PASSWORD: ${MOCK_B_DB_PASSWORD:?generate secrets in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    ports: ["127.0.0.1:5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  redis:
+    image: redis:7.4.6-bookworm
+    ports: ["127.0.0.1:6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+  api:
+    <<: *app
+    ports: ["127.0.0.1:${API_PORT:-8000}:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=4)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  worker:
+    <<: *app
+    command: ["taskiq", "worker", "payments.infrastructure.worker:broker", "--workers", "1", "--ack-type", "manual", "--shutdown-timeout", "10"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "payments.infrastructure.worker_health"]
+      interval: 5s
+      timeout: 4s
+      retries: 10
+  dispatcher:
+    <<: *app
+    command: ["python", "-m", "payments.infrastructure.dispatcher"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+  mock-a:
+    <<: *app
+    environment:
+      MOCK_SERVICE_CREDENTIAL: ${MOCK_SERVICE_CREDENTIAL}
+      DATABASE_URL: postgresql+asyncpg://mock_a:${MOCK_A_DB_PASSWORD}@postgres:5432/mock_a
+    command: ["uvicorn", "mock_provider.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["127.0.0.1:8001:8000"]
+    healthcheck: &mock-health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  mock-b:
+    <<: *app
+    environment:
+      MOCK_SERVICE_CREDENTIAL: ${MOCK_SERVICE_CREDENTIAL}
+      DATABASE_URL: postgresql+asyncpg://mock_b:${MOCK_B_DB_PASSWORD}@postgres:5432/mock_b
+    command: ["uvicorn", "mock_provider.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["127.0.0.1:8002:8000"]
+    healthcheck: *mock-health
+
+volumes:
+  postgres-data:

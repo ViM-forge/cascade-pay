@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+!.env.example
+.venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+plan
+docs/ai_usage_desc
+docs/dev_desc
+**/AGENTS.md
+.agents
+.codex
+tmp
+*.log
