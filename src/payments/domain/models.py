@@ -155,7 +155,11 @@ class PaymentAttempt(BaseModel):
         )
 
     def expire_in_flight(self, now: datetime, deadline: datetime) -> Self:
-        """Losing an owner means uncertainty, never permission to switch provider."""
+        """Invalidate expired ownership and make lookup due immediately if not scheduled.
+
+        Preserve identity, safe window, count and any saved deadline/due. Expiry
+        means uncertainty, never permission to switch provider.
+        """
         if self.status != "in_flight" or self.lease_until is None or now < self.lease_until:
             raise ValueError("claim has not expired")
         return type(self)(
@@ -218,6 +222,7 @@ class PaymentAttempt(BaseModel):
         )
 
     def owns_result(self, version: int, now: datetime) -> bool:
+        """Require a matching live claim; count/deadline only limit new claims."""
         return (
             self.status in {"in_flight", "unknown"}
             and not self.manual_review_required

@@ -375,8 +375,10 @@ async def stats(request: Request, key: UUID | None = None, method_ref: str | Non
 async def wait_barrier(engine, key, point):
     """Persist reached before waiting; never hold a DB transaction during the wait.
 
-    before_charge_commit gates entry into the atomic charge transaction. Timeout
-    releases only the HTTP handler, never changes the operation or ledger.
+    before_charge_commit gates entry into the atomic charge transaction. After
+    30 seconds without release, TimeoutError exits the handler: a before-barrier
+    never enters charge, while an after-barrier keeps its committed operation.
+    Timeout does not mark the barrier released or change operation/ledger data.
     """
     async with engine.begin() as c:
         await c.execute(

@@ -1,6 +1,6 @@
 # Контракты и решения MVP
 
-Статус: контракты приняты; окружение, health и базовая миграция реализованы и проверены — [проверки окружения](verification.md). Success через A и последовательный каскад после подтверждённых разрешённых отказов реализованы; проверки и ограничения — в verification.md. Ограниченная сверка unknown реализована; общий DB recovery реализован; фактические проверки — в verification.md. Нормативный контракт провайдеров: [provider-contract.md](provider-contract.md), критерии будущей проверки: [acceptance.md](acceptance.md).
+Статус: контракты приняты; окружение, health и базовая миграция реализованы и проверены — [проверки окружения](verification.md). Success через A и последовательный каскад после подтверждённых разрешённых отказов реализованы; проверки и ограничения — в verification.md. Ограниченная сверка unknown реализована; общий DB recovery реализован; фактические проверки — в verification.md. Нормативный контракт провайдеров: [provider-contract.md](provider-contract.md), матрица исполняемых проверок: [acceptance.md](acceptance.md).
 
 ## Объём и архитектура
 
@@ -22,7 +22,7 @@ flowchart LR
 
 Domain entities — отдельные Pydantic v2 BaseModel, `frozen=True`, `extra=forbid`, идентичность по UUID, явные методы переходов. DTO и ORM отдельны, преобразование явное. Новый снимок после проверки перехода создаётся с полной валидацией; `model_construct` и `model_copy(update=...)` для обхода правил запрещены: эти обходные пути не проверяют обновлённые данные ([Pydantic models](https://docs.pydantic.dev/latest/concepts/models/)). Pydantic в domain — осознанное исключение для стека задания. Strict-проверки задаются явно: библиотека допускает преобразования типов по умолчанию ([Pydantic](https://docs.pydantic.dev/latest/concepts/strict_mode/)).
 
-Выбранный стек реализации: Python 3.13, FastAPI, PostgreSQL, Redis/Taskiq, SQLAlchemy async/asyncpg, Alembic, httpx, Pydantic v2/pydantic-settings, PyJWT, Poetry/lock, Docker Compose, pytest, Ruff lint/format. API запускается двумя Gunicorn worker с отдельным `uvicorn-worker`; встроенный `uvicorn.workers` устарел ([Uvicorn](https://uvicorn.dev/deployment/#gunicorn)). DB pool создаётся внутри процесса, preload не используется. Worker и dispatcher — отдельные процессы той же кодовой базы; фоновые циклы не запускаются в ASGI startup каждого worker. Точные версии зависимостей и совместимость фиксируются при bootstrap, здесь установка не выполнялась.
+Выбранный стек реализации: Python 3.13, FastAPI, PostgreSQL, Redis/Taskiq, SQLAlchemy async/asyncpg, Alembic, httpx, Pydantic v2/pydantic-settings, PyJWT, Poetry/lock, Docker Compose, pytest, Ruff lint/format. API запускается двумя Gunicorn worker с отдельным `uvicorn-worker`; встроенный `uvicorn.workers` устарел ([Uvicorn](https://uvicorn.dev/deployment/#gunicorn)). DB pool создаётся внутри процесса, preload не используется. Worker и dispatcher — отдельные процессы той же кодовой базы; фоновые циклы не запускаются в ASGI startup каждого worker. Точные версии зависимостей закреплены в `poetry.lock`; версии образов и команды процессов — в `Dockerfile` и `compose.yaml`. Фактические проверки совместимости приведены в [verification.md](verification.md).
 
 За пределами MVP: реальный sandbox/деньги, UI, webhooks, подписки, возвраты, capture, FX, 3DS, динамический роутинг, circuit breaker, микросервисы, мониторинговая платформа. Нет обещания production-ready, exactly-once доставки или RPS/100 000 пользователей. S3/aioboto3 не включены: нет файлового сценария; работающая выгрузка отчёта потребовала бы нового API и проверок. Реальный sandbox потребовал бы внешних credentials и отдельной проверки идемпотентности/lookup; устойчивые mock позволяют воспроизводить нужные сбои.
 
@@ -37,7 +37,7 @@ Canonical JSON строится только из трёх проверенны�
 В одной транзакции создаются payment(pending) и outbox; после commit — 202 `{"id":"<UUID>","status":"pending"}` и `Location: /payments/<UUID>`. Повтор равных данных всегда 202 с тем же id и текущим status, включая terminal. Другие данные — 409 `{"error":{"code":"idempotency_conflict"}}`. Конкурентная вставка использует `INSERT ON CONFLICT DO NOTHING RETURNING`, затем отдельный SELECT победителя при READ COMMITTED. Уникальный конфликт в этом SQL не является исключением и не переводит транзакцию в aborted state; следующий statement получает новый snapshot. Сравниваются hash **и** нормализованные поля. Для настоящей ошибки INSERT требуется rollback/savepoint; продолжать чтение из aborted transaction нельзя.
 Семантика подтверждена [PostgreSQL 17: isolation](https://www.postgresql.org/docs/17/transaction-iso.html#XACT-READ-COMMITTED), [INSERT](https://www.postgresql.org/docs/17/sql-insert.html#SQL-ON-CONFLICT) и [SQLAlchemy 2.0](https://docs.sqlalchemy.org/en/20/dialects/postgresql.html#insert-on-conflict-upsert). В проекте SQLAlchemy 2.0.57/asyncpg 0.32.0, фактический уровень изоляции проверяет integration-тест. Изменение уровня изоляции требует пересмотра протокола. Удаления платежей/ключей и TTL в MVP нет. Недоступность Redis после commit не отменяет платёж. Недоступность БД — 503, клиент повторяет исходный key; потеря ответа на commit не доказывает отсутствие платежа.
 
-`GET /payments/{id}` — 200 с `id, status, amount_minor, currency, created_at, updated_at, manual_review_required, attempts`. UUID и время передаются строками, время UTC RFC3339. Attempts упорядочены по sequence и содержат только `id, sequence, provider, status, external_id|null, error_code|null, check_count, manual_review_required, created_at, updated_at`. Marker платежа вычисляется по активной попытке. Не выдавать method_ref, provider key, request_hash, lease/version, credentials или сырой ответ провайдера. Неизвестный/чужой UUID — одинаковый 404 `{"error":{"code":"payment_not_found"}}`; некорректный UUID — 422. Прочие validation errors имеют код `validation_error` и безопасный список имён полей, без исходных значений.
+`GET /payments/{id}` — 200 с `id, status, amount_minor, currency, created_at, updated_at, manual_review_required, attempts`. UUID и время передаются строками, время UTC RFC3339. Attempts упорядочены по sequence и содержат только `id, sequence, provider, status, external_id|null, error_code|null, check_count, manual_review_required, created_at, updated_at`. Marker платежа вычисляется как наличие manual marker хотя бы у одной из сохранённых попыток. Не выдавать method_ref, provider key, request_hash, lease/version, credentials или сырой ответ провайдера. Неизвестный/чужой UUID — одинаковый 404 `{"error":{"code":"payment_not_found"}}`; некорректный UUID — 422. Прочие validation errors имеют код `validation_error` и безопасный список имён полей, без исходных значений.
 
 JWT: PyJWT, разрешён только HS256, algorithms задаётся сервером. Обязательны sub/exp/iat/iss/aud; issuer=payments-demo, audience=payments-api, sub — UUID одного из двух merchant из конфигурации. Проверяются подпись, issuer/audience, exp, iat (не в будущем), exp>iat и TTL не более 900 с; leeway=0. exp/iat — целые NumericDate без bool. Поддержка обязательных claims и проверки сроков описана в [PyJWT](https://pyjwt.readthedocs.io/en/stable/usage.html). Отсутствующий/невалидный токен — 401 с `WWW-Authenticate: Bearer` и кодом `unauthorized`. Старый API key не поддерживается. Локальный CLI выдаёт demo-токены с TTL 15 минут; публичного login, refresh, revocation, ротации и IdP нет. Секрет — минимум 32 случайных байта через env; рабочие секреты и JWT не коммитятся и не логируются.
 
@@ -85,7 +85,7 @@ Payload попытки восстанавливается из неизменн�
 ### Точная последовательность сверки
 
 1. Под lock payment → attempt: terminal/manual → no-op; затем **действующий lease → no-op до проверки лимитов**. Recovery не отбирает пятую проверку у живого владельца.
-2. Expired in_flight переводится в unknown, payment unknown; прежний version инвалидируется. При первом unknown установить deadline=now+60с и next_check_at=now+1с, check_count оставить прежним. Для обычного ответа unknown эти поля задаются в транзакции сохранения ответа. Deadline больше не сдвигается.
+2. Expired in_flight переводится в unknown, payment unknown; прежний version инвалидируется. При первом unknown установить deadline=now+60с, check_count оставить прежним. При expiry in_flight первая сверка доступна сразу (next_check_at=now); при обычном ответе unknown или истечении окна первой отправки — через 1с, не позже deadline. Уже сохранённые deadline и next_check_at при expiry не сдвигаются; для обычного ответа unknown поля задаются в транзакции сохранения ответа.
 3. У unknown без действующего lease проверить check_count>=5 или now>=deadline **раньше due-проверки**. Если да: claim_version+=1, lease_until=NULL, marker=true, next_check_at=NULL; commit. Без HTTP, без B, payment остаётся unknown. Recovery выбирает и unknown с истёкшим lease и исчерпанным бюджетом, даже если due-время ещё не наступило.
 4. Если бюджет есть, но now<next_check_at — no-op. Иначе atomically claim_version+=1, lease_until=now+10с, check_count+=1; commit **до lookup**. Unknown не переводить в in_flight; lease показывает, что сверка выполняется. Не обнулять next_check_at до результата, чтобы crash оставался виден recovery.
 5. Один цикл = один lookup и максимум один charge по обычному not_found. Pending/ошибка lookup не вызывает charge. Перед повторным charge проверить сохранённый version, lease и now<safe_retry_until в короткой транзакции, закрыть её, затем HTTP; на точной границе окна повтор запрещён. Не выполнять цикл повторно на уровне HTTP-клиента. Каждый HTTP ограничен общим wall-clock timeout=2с (отдельные socket timeouts недостаточны). Два вызова должны укладываться в lease 10с; если lease кончился — ответ не сохранять.
@@ -100,11 +100,11 @@ Settings должны проверять положительность инте
 
 ### Брокер, ACK и повторная доставка
 
-Выбран `taskiq_redis.RedisStreamBroker`: одна stream `payments`, consumer group `payments-workers`, consumer_name уникален на процесс, consumer_id=`0-0`, mkstream=true, maxlen=None (не обрезать неподтверждённые записи). Параметры: xread_block=2000мс, idle_timeout=10000мс, xread_count=100, unacknowledged_batch_size=100, unacknowledged_lock_timeout=5с. Redis должен поддерживать XAUTOCLAIM (>=6.2). Конкретные версии всего стека фиксируются в lock при bootstrap.
+Выбран `taskiq_redis.RedisStreamBroker`: одна stream `payments`, consumer group `payments-workers`, consumer_name уникален на процесс, consumer_id=`0-0`, mkstream=true, maxlen=None (не обрезать неподтверждённые записи). Параметры: xread_block=2000мс, idle_timeout=10000мс, xread_count=1, unacknowledged_batch_size=100, unacknowledged_lock_timeout=5с. Redis должен поддерживать XAUTOCLAIM (>=6.2). Версии Python-пакетов закреплены в `poetry.lock`; Compose использует Redis 7.4.6.
 
-В проверенном [исходнике taskiq-redis 1.2.4](https://raw.githubusercontent.com/taskiq-python/taskiq-redis/1.2.4/taskiq_redis/redis_broker.py) возврат pending расположен после чтения новых записей; пустое чтение пропускает его. Поэтому инфраструктурный адаптер поверх RedisStreamBroker обязан выполнять независимый reclaim каждые 2с, даже без новых публикаций: XAUTOCLAIM с idle>=10с, batch=100, продолжение с возвращённого cursor, доставка исходных байтов как AckableMessage с ACK исходного stream ID. Не переиздавать reclaimed сообщение как новую финансовую команду. Reclaim может дублировать ещё работающий handler — DB lease/version остаются обязательны. Это требование реализации, не уже проверенная возможность установленного пакета. [XAUTOCLAIM](https://redis.io/docs/latest/commands/xautoclaim/) переносит владение pending-сообщением; [XACK](https://redis.io/docs/latest/commands/xack/) снимает его из pending.
+В проверенном [исходнике taskiq-redis 1.2.4](https://raw.githubusercontent.com/taskiq-python/taskiq-redis/1.2.4/taskiq_redis/redis_broker.py) возврат pending расположен после чтения новых записей; пустое чтение пропускает его. Поэтому инфраструктурный адаптер поверх RedisStreamBroker обязан выполнять независимый reclaim каждые 2с, даже без новых публикаций: XAUTOCLAIM с idle>=10с, batch=100, продолжение с возвращённого cursor, доставка исходных байтов как AckableMessage с ACK исходного stream ID. Не переиздавать reclaimed сообщение как новую финансовую команду. Reclaim может дублировать ещё работающий handler — DB lease/version остаются обязательны. Адаптер реализован в `stream_broker.py`; возврат исходного pending без новых публикаций проверяет `test_stream_reclaim_without_publications`, crash до/после commit — runtime-матрица в [verification.md](verification.md). [XAUTOCLAIM](https://redis.io/docs/latest/commands/xautoclaim/) переносит владение pending-сообщением; [XACK](https://redis.io/docs/latest/commands/xack/) снимает его из pending.
 
-Для платёжных задач выбрать `ack_type=manual`; `Context.ack()` вызывается после commit результата либо после проверенного no-op (terminal/manual/active lease/not due). Исключение до commit не подтверждать. Если unknown сохранён и дальнейшее действие записано в БД — ACK допустим. ACK не ждёт финансового успеха. Режимы ACK описаны в [Taskiq CLI](https://taskiq-python.github.io/guide/cli.html#acknowledgements); `when_saved` относится к result backend, а не PostgreSQL приложения. Result backend не источник платёжного результата.
+Для платёжных задач в Compose задан `--ack-type manual`; `Context.ack()` вызывается после commit результата либо после проверенного no-op (terminal/manual/active lease/not due). Исключение до commit не подтверждать. Если unknown сохранён и дальнейшее действие записано в БД — ACK допустим. ACK не ждёт финансового успеха. Режимы ACK описаны в [Taskiq CLI](https://taskiq-python.github.io/guide/cli.html#acknowledgements); `when_saved` относится к result backend, а не PostgreSQL приложения. Result backend не источник платёжного результата.
 
 At-least-once на уровне транспорта условно: сохранены stream/group/pending, работают consumer и periodic reclaim, нет trim/удаления. Убийство worker до ACK → повтор исходного сообщения; после commit до ACK → безопасный дубль. Поддержка ACK Stream и отсутствие ACK у PubSub/ListQueue указаны в [документации taskiq-redis](https://github.com/taskiq-python/taskiq-redis#brokers). Потеря/flush/recreate Redis теряет эти гарантии брокера. После восстановления соединения пересоздаётся consumer group с 0-0; dispatcher по PostgreSQL повторно публикует незавершённую работу, даже при published_at!=NULL. Утраченные задачи terminal/manual не восстанавливаются, поскольку работы для них нет. Пока Redis недоступен, DB сохраняет намерение, но фонового прогресса не обещаем. Exactly-once доставки нет.
 
@@ -119,7 +119,7 @@ Manual review: сохранить unknown, marker=true, next_check_at=NULL; ав
 Защита от повторного списания зависит от долговечной идемпотентности, канонического lookup и невозможности позднего списания после отказа у провайдера. Lease/version защищают локальное состояние, но не отменяют уже отправленный внешний запрос. Mock хранят ключи весь срок данных, безопасное окно отправки ограничено 24 ч; после него только lookup в оставшемся бюджете или ручной разбор. Недоступность зависимостей не имеет обещанного SLA. Реальные платёжные токены не считаются переносимыми между провайдерами.
 
 
-## Реализованные предохранители перед автоматической сверкой
+## Предохранители отправки и сверки
 
 Первая отправка также ограничена safe_retry_until: domain claim отвергает
 now >= safe_retry_until. Repository под lock payment → attempt читает
@@ -134,12 +134,14 @@ declined_terminal/not_charged_final/pending. Unknown/not_found — внутре�
 external_id не переносится в нормализованный результат.
 
 Publisher различает process_payment и reconcile_payment; второе публикуется
-только при готовности unknown. Дополнительный bounded due-проход читает unknown
-из PostgreSQL независимо от published_at. При активном lease и manual нет HTTP.
-Общий recovery других статусов не добавлен. Новых registry/универсальных движков нет.
+только при готовности unknown. Повторное планирование независимо от published_at
+выполняет общий `PaymentRepository.recover_batch`: отдельного due-scheduler нет.
+Recovery и publisher используют общий SQL-предикат `reconciliation_ready`,
+а worker повторно проверяет доменные правила после блокировок.
+При активном lease и manual нет нового HTTP. Подробнее — [реализация восстановления](#реализация-восстановления).
 
 
-## Реализация сверки и граница следующего этапа
+## Реализация сверки
 
 `Payment.apply_result` и общая cascade_decision применяют одну таблицу результатов
 к processing/in_flight и unknown/unknown. Только подтверждённый финал разрешает
@@ -155,8 +157,10 @@ Deadline/count не используются как veto для финала д�
 HTTP adapter отдельно валидирует lookup404 (ровно key/status) и canonical200.
 Дубликат до due, при lease, manual или terminal делает no-op и ACK после commit.
 
-Новая mock_0004 добавляет pending и persisted lookup mode/count; payments schema
-0001 оказалась достаточной. Applied migrations не переписывались. Для настоящего
+Миграция mock_0004 добавила pending и persisted lookup mode/count. Для самой
+сверки было достаточно payments 0001; последующая payments 0002 добавила индексы
+recovery. Для запуска применяются все миграции payments и обоих mock.
+Applied migrations не переписывались. Для настоящего
 разрыва выбран test-only TCP proxy, чтобы не зависеть от внутренних Uvicorn
 transport API; исключение ASGI до response start даёт 500, а не потерю ответа
 ([source Uvicorn 0.54.0](https://github.com/Kludex/uvicorn/blob/0.54.0/uvicorn/protocols/http/h11_impl.py)).

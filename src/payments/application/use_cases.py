@@ -7,6 +7,7 @@ from payments.domain.models import Payment
 async def create_payment(
     uow: UoW, merchant: UUID, key: str, amount: int, currency: str, ref: str, *, checkpoint=None
 ) -> Payment:
+    """Commit payment/outbox together; matching key and payload return the saved payment."""
     async with uow:
         now = await uow.now()
         payment = Payment(
@@ -28,6 +29,7 @@ async def create_payment(
 
 
 async def get_payment(uow: UoW, identity: UUID, merchant: UUID) -> dict | None:
+    """Read the merchant-scoped public projection, excluding provider keys and method ref."""
     async with uow:
         return await uow.payments.get(identity, merchant)
 
@@ -35,6 +37,12 @@ async def get_payment(uow: UoW, identity: UUID, merchant: UUID) -> dict | None:
 async def process_payment(
     uow: UoW, provider: Provider, identity: UUID, *, checkpoint=None
 ) -> tuple[str, UUID | None, str | None]:
+    """Commit preparation and claim separately, then charge outside any UoW.
+
+    Persist only a result still owned by this claim. Return outcome, attempt ID
+    and provider; stale means ownership was lost, noop means no HTTP was needed.
+    Exceptions propagate so the Taskiq adapter leaves the message unacknowledged.
+    """
     async with uow:
         await uow.payments.prepare(identity)
         await uow.commit()
@@ -62,6 +70,12 @@ async def process_payment(
 async def reconcile_payment(
     uow: UoW, provider: Provider, identity: UUID, *, checkpoint=None
 ) -> tuple[str, UUID | None, str | None]:
+    """Consume a persisted check slot before lookup, with no transaction during HTTP.
+
+    Only canonical lookup not_found permits one same-key charge after a committed
+    ownership/window recheck. Pending and transport errors never permit a charge.
+    Return the same outcome/attempt/provider tuple as process_payment.
+    """
     async with uow:
         claimed = await uow.payments.claim_reconciliation(identity)
         await uow.commit()

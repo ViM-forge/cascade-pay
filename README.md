@@ -38,6 +38,9 @@ URL-пароли должны быть percent-encoded; генератор ис�
 
 Если порт 8000 занят, добавьте `API_PORT=18000` в `.env`, используйте этот порт
 в curl и передайте `--api-port 18000` скрипту check_bootstrap.py.
+Для host-only runtime ниже API_URL по умолчанию равен `http://127.0.0.1:18000`;
+если API работает на стандартном порту 8000, перед запуском задайте
+`export API_URL=http://127.0.0.1:8000`. Внутри Compose используется `http://api:8000`.
 
 Init-скрипт выполняется PostgreSQL только на новом volume. Он создаёт отдельные
 БД и роли payments/mock_a/mock_b и закрывает межбазовый CONNECT. Payments-процессы
@@ -53,7 +56,10 @@ API: Gunicorn запускает два `uvicorn_worker.UvicornWorker` без pr
 процесс создаёт engine/pool в FastAPI lifespan и освобождает при остановке.
 Taskiq запускает два независимых worker-процесса (по одной активной async-задаче); dispatcher — отдельный процесс того же образа; dispatcher публикует неопубликованный outbox с ограниченным timeout, затем отмечает published_at. Сессия SQLAlchemy создаётся отдельно для каждой единицы работы
 (UoW — одной операции с общей транзакцией), общих глобальных сессий нет.
-Ready проверяет PostgreSQL и Redis; live — только процесс. Mock для ready API
+Ready API проверяет PostgreSQL и Redis; live — только процесс.
+Health worker проверяет свежесть heartbeat чтения Redis; health dispatcher —
+наличие процесса. Mock live/ready отвечают без проверки БД. Эти проверки
+не подтверждают завершение платежей; для этого нужны e2e и provider stats. Mock для ready API
 не требуются. Порты опубликованы только на loopback.
 
 Stream payments, group payments-workers, manual ACK, без trim. Адаптер для
@@ -97,7 +103,7 @@ Settings явно читает `.env`; environment имеет приоритет
 одновременно. Данные хранятся в volume PostgreSQL; JSON-логи приложения содержат событие, уровень, logger, PID и контекст обработки
 payment_id/attempt_id/provider/duration/result; без произвольных исключений/credentials.
 
-Контракты и будущие критерии: [решения](docs/decisions.md),
+Контракты и матрица проверок: [решения](docs/decisions.md),
 [провайдеры](docs/provider-contract.md), [приёмка](docs/acceptance.md).
 
 Фактические результаты: [verification](docs/verification.md).

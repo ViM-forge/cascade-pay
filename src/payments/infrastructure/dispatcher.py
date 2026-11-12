@@ -14,7 +14,12 @@ from payments.infrastructure.worker import broker, process, reconcile, settings
 
 
 async def publish_one(sessions):
-    """Publish before marking; scheduling truth remains in PostgreSQL."""
+    """Publish one eligible outbox event, then mark it in a separate transaction.
+
+    Close the read session before broker I/O. A crash after publish can duplicate
+    delivery; failure before marking leaves the event available for retry.
+    Reconciliation eligibility is a SQL preselection, rechecked by the worker.
+    """
     async with sessions() as session:
         row = await session.scalar(
             select(OutboxRow)

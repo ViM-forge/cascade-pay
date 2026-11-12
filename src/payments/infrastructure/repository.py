@@ -26,6 +26,12 @@ def store_attempt(row, entity):
 
 
 class PaymentRepository:
+    """Persist domain decisions in the caller's session; methods never commit.
+
+    Updates lock an existing payment before its latest attempt. Read database time
+    after locks for ownership decisions; HTTP belongs outside this repository.
+    """
+
     def __init__(self, session, settings):
         self.session, self.settings = session, settings
 
@@ -129,7 +135,12 @@ class PaymentRepository:
         return payment, attempt
 
     async def recover_batch(self, batch=20):
-        """DB-only scheduling. Lock payments before attempts, as all worker paths do."""
+        """Repair/schedule at most batch aged payments in a DB-only transaction.
+
+        SKIP LOCKED skips busy payments; published outbox does not suppress new
+        work. Preserve saved key/window/budget and deduplicate unpublished events
+        per payment/event type. Live leases and manual attempts are excluded.
+        """
         now = await self.session.scalar(select(func.clock_timestamp()))
         active = (
             select(AttemptRow.id)
@@ -266,6 +277,10 @@ class PaymentRepository:
         # The caller commits the immutable attempt identity before taking a claim.
 
     async def claim(self, identity):
+        """Claim created work, or persist unknown/outbox if its send window expired.
+
+        None can therefore include writes; the caller must commit even a no-op.
+        """
         p, a = await self.locked(identity)
         if p is None or p.status in {"succeeded", "failed"} or a is None:
             return None
@@ -329,6 +344,12 @@ class PaymentRepository:
         )
 
     async def finish(self, attempt, result):
+        """Fence stale responses and atomically save outcome, next attempt and outbox.
+
+        Return False without applying the response when identity/status/version
+        or the live lease no longer matches. Count/deadline do not veto a final
+        response from a live owner. The caller owns the final commit.
+        """
         p, a = await self.locked(attempt.payment_id)
         now = await self.session.scalar(select(func.clock_timestamp()))
         if (
@@ -367,6 +388,12 @@ class PaymentRepository:
 
 
 class SqlUoW:
+    """Open a fresh session per entry; commit explicitly, close on every exit.
+
+    Closing rolls back any uncommitted transaction. Re-entering sequentially is
+    supported; a UoW instance must not be shared by concurrent tasks.
+    """
+
     def __init__(self, sessions, settings):
         self.sessions, self.settings = sessions, settings
 

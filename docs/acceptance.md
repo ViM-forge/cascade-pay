@@ -22,7 +22,9 @@ poetry run python scripts/check_recovery_runtime.py
 Предварительно выполните настройку из README: настоящий Compose PostgreSQL/Redis,
 миграции, API, worker, dispatcher, mock A/B с APP_PROFILE=demo/test; на хосте
 доступны `.env`, зависимости и порты. API_URL по умолчанию для runtime —
-http://127.0.0.1:18000. Команды не удаляют PostgreSQL volumes. Runtime управляет
+http://127.0.0.1:18000. Для API на порту 8000 перед запуском задайте
+`export API_URL=http://127.0.0.1:8000` (для pytest это также устраняет зависимость
+от его собственного значения по умолчанию). Команды не удаляют PostgreSQL volumes. Runtime управляет
 процессами и восстанавливает сервисы в finally; запускайте только на demo-окружении.
 Recovery runtime намеренно очищает и пересоздаёт Redis этого Compose проекта.
 
@@ -88,6 +90,8 @@ D6: `poetry run python scripts/demo.py restart-recovery` на хосте.
 | G20 | `test_reconciliation_db.py::test_fifth_live_owner_saves_final_after_deadline_atomically`; `test_deadline_precedes_due_and_no_new_claim` | Активный lease важнее deadline, новый claim после deadline запрещён |
 | G21 | `R::claim_before_ack_reclaim`; `R::commit_before_ack_reclaim`; `test_bootstrap.py::test_stream_reclaim_without_publications` | Исходный stream ID reclaimed/ACK без новых сообщений/DB recovery; после commit дубль без HTTP |
 | G22 | `tests/unit/test_reconciliation_limits.py::test_initial_due_and_deadline_are_bounded`; `test_backoff_from_result_preserves_deadline_and_count`; `test_backoff_never_exceeds_deadline`; `test_claim_order_and_boundaries`; `test_safe_retry_boundary`; `tests/unit/test_recovery_policy.py::test_expiry_preserves_identity_window_budget_and_deadline` | 1/2/4/8/16, точные границы lease/deadline/window; crash не сбрасывает историю |
+| G23 | `test_initial_window_db.py::test_expired_created_transition_is_atomic_and_duplicate_is_noop`; `test_expired_created_process_commits_without_calling_provider`; `test_first_window_checked_after_waiting_for_payment_lock` | Истёкшее окно первой отправки → unknown/outbox без charge/B; проверка времени после lock, дубль безопасен |
+| G24 | `test_recovery.py::test_unknown_recovery_readiness`; `test_new_attempt_initialization_and_saved_window_survive_cascade`; `test_reconciliation_transport.py::test_readiness_exact_db_time_and_explicit_limit` | Общий SQL-отбор учитывает точные границы и явный лимит; новая A/B получает отдельный key/window, повтор сохраняет их |
 
 ## Подготовительные fixtures и ограничения
 

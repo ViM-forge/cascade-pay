@@ -31,6 +31,13 @@ class ChargeResponse(BaseModel):
 
 
 class HttpProvider:
+    """Validate charge/lookup against the saved operation under a wall-clock timeout.
+
+    Unexpected envelopes, HTTP codes and transport failures become unknown with
+    no external ID. Only an exact lookup 404 envelope becomes not_found. No
+    automatic HTTP retries: application policy controls every same-key charge.
+    """
+
     def __init__(self, settings):
         self.settings = settings
 
