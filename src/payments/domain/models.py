@@ -48,7 +48,7 @@ class Payment(BaseModel):
     def transition(self, status: str, now: datetime) -> Self:
         allowed = {
             "pending": {"processing"},
-            "processing": {"succeeded", "unknown"},
+            "processing": {"succeeded", "unknown", "failed"},
             "unknown": {"succeeded"},
         }
         if status not in allowed.get(self.status, set()):
@@ -60,10 +60,11 @@ class PaymentAttempt(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
     id: UUID
     payment_id: UUID
-    sequence: Literal[1] = 1
-    provider: Literal["A"] = "A"
+    sequence: Literal[1, 2] = 1
+    provider: Literal["A", "B"] = "A"
     provider_idempotency_key: UUID
-    status: Literal["created", "in_flight", "unknown", "succeeded"] = "created"
+    status: Literal["created", "in_flight", "unknown", "succeeded", "declined"] = "created"
+    error_code: str | None = None
     external_id: UUID | None = None
     claim_version: int = Field(default=0, ge=0)
     lease_until: datetime | None = None
@@ -77,8 +78,8 @@ class PaymentAttempt(BaseModel):
     def invariants(self):
         if self.id != self.provider_idempotency_key:
             raise ValueError("attempt key must equal identity")
-        if self.status == "succeeded" and self.external_id is None:
-            raise ValueError("success requires external identity")
+        if self.status in {"succeeded", "declined"} and self.external_id is None:
+            raise ValueError("final attempt requires external identity")
         if self.status == "in_flight" and (self.lease_until is None or not self.claim_version):
             raise ValueError("in-flight requires ownership")
         return self
@@ -108,7 +109,7 @@ class PaymentAttempt(BaseModel):
         self,
         version: int,
         now: datetime,
-        external_id: UUID | None,
+        result: "ProviderResult",
         deadline: datetime,
         next_check: datetime,
     ) -> Self:
@@ -119,16 +120,77 @@ class PaymentAttempt(BaseModel):
             or now >= self.lease_until
         ):
             raise ValueError("attempt ownership expired")
+        status = result.attempt_status
         return type(self)(
             **(
                 self.model_dump()
                 | dict(
-                    status="succeeded" if external_id else "unknown",
-                    external_id=external_id,
+                    status=status,
+                    error_code=result.error_code,
+                    external_id=result.external_id,
                     lease_until=None,
                     updated_at=now,
-                    reconciliation_deadline=None if external_id else deadline,
-                    next_check_at=None if external_id else next_check,
+                    reconciliation_deadline=deadline if status == "unknown" else None,
+                    next_check_at=next_check if status == "unknown" else None,
                 )
             )
         )
+
+
+class ProviderResult(BaseModel):
+    """Normalized result; final declines rely on the provider's durable-key contract."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    status: Literal[
+        "succeeded",
+        "declined_retryable",
+        "declined_terminal",
+        "not_charged_final",
+        "pending",
+        "unknown",
+        "not_found",
+    ]
+    error_code: str | None = None
+    external_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def canonical(self):
+        codes = {
+            "succeeded": None,
+            "declined_retryable": "issuer_unavailable",
+            "declined_terminal": "invalid_payment_method",
+            "not_charged_final": "not_charged_final",
+            "pending": None,
+            "unknown": None,
+            "not_found": None,
+        }
+        if self.error_code != codes[self.status]:
+            raise ValueError("invalid status/error pair")
+        if self.status not in {"unknown", "not_found"} and self.external_id is None:
+            raise ValueError("canonical operation requires external identity")
+        return self
+
+    @property
+    def attempt_status(self):
+        if self.status == "succeeded":
+            return "succeeded"
+        if self.status in {"declined_retryable", "declined_terminal", "not_charged_final"}:
+            return "declined"
+        return "unknown"
+
+
+def cascade_decision(payment: Payment, attempt: PaymentAttempt, result: ProviderResult):
+    """Return payment status and optional next provider from the saved route only."""
+    if payment.status != "processing" or attempt.status != "in_flight":
+        raise ValueError("result requires active payment and attempt")
+    if attempt.payment_id != payment.id:
+        raise ValueError("attempt belongs to another payment")
+    if payment.routing_snapshot[attempt.sequence - 1] != attempt.provider:
+        raise ValueError("attempt differs from saved route")
+    if result.status == "succeeded":
+        return "succeeded", None
+    if result.attempt_status == "unknown":
+        return "unknown", None
+    if result.status == "declined_terminal" or attempt.sequence == len(payment.routing_snapshot):
+        return "failed", None
+    return "processing", payment.routing_snapshot[attempt.sequence]

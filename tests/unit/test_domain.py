@@ -4,7 +4,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from payments.domain.models import Payment, PaymentAttempt
+from payments.domain.models import Payment, PaymentAttempt, ProviderResult
 from payments.presentation.dto import CreatePayment
 
 
@@ -46,8 +46,14 @@ def test_attempt_ownership():
     a = a.claim(now, now + timedelta(seconds=10))
     for version, clock in [(0, now), (1, now + timedelta(seconds=10))]:
         with pytest.raises(ValueError):
-            a.finish(version, clock, uuid4(), clock, clock)
-    a = a.finish(1, now, uuid4(), now, now)
+            a.finish(
+                version,
+                clock,
+                ProviderResult(status="succeeded", external_id=uuid4()),
+                clock,
+                clock,
+            )
+    a = a.finish(1, now, ProviderResult(status="succeeded", external_id=uuid4()), now, now)
     assert a.status == "succeeded"
     with pytest.raises(ValueError):
         a.claim(now, now + timedelta(seconds=10))
@@ -81,7 +87,11 @@ def test_unknown_blocks_new_claim_and_false_failure():
         updated_at=now,
     )
     a = a.claim(now, now + timedelta(seconds=10)).finish(
-        1, now, None, now + timedelta(seconds=60), now + timedelta(seconds=1)
+        1,
+        now,
+        ProviderResult(status="unknown"),
+        now + timedelta(seconds=60),
+        now + timedelta(seconds=1),
     )
     assert a.status == "unknown" and a.next_check_at == now + timedelta(seconds=1)
     with pytest.raises(ValueError):

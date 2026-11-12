@@ -28,7 +28,9 @@ async def get_payment(uow: UoW, identity: UUID, merchant: UUID) -> dict | None:
         return await uow.payments.get(identity, merchant)
 
 
-async def process_payment(uow: UoW, provider: Provider, identity: UUID) -> str:
+async def process_payment(
+    uow: UoW, provider: Provider, identity: UUID
+) -> tuple[str, UUID | None, str | None]:
     async with uow:
         await uow.payments.prepare(identity)
         await uow.commit()
@@ -36,10 +38,10 @@ async def process_payment(uow: UoW, provider: Provider, identity: UUID) -> str:
         claimed = await uow.payments.claim(identity)
         await uow.commit()
     if claimed is None:
-        return "noop"
+        return "noop", None, None
     payment, attempt = claimed
-    external_id = await provider.charge(payment, attempt)
+    result = await provider.charge(payment, attempt)
     async with uow:
-        saved = await uow.payments.finish(attempt, external_id)
+        saved = await uow.payments.finish(attempt, result)
         await uow.commit()
-    return ("succeeded" if external_id else "unknown") if saved else "stale"
+    return result.status if saved else "stale", attempt.id, attempt.provider

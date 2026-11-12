@@ -82,3 +82,59 @@ payments; после исправления повторные миграции 
 Unknown и expired in_flight пока требуют будущих сверки/recovery; их нельзя считать
 failed или основанием для нового клиентского ключа. Список актуальных проблем —
 [known-issues.md](known-issues.md).
+
+
+## Новые проверки: последовательный каскад — 2026-11-12
+
+Проверки ниже выполнены заново; исторические результаты выше не включены в число
+новых тестов. Использован существующий `cascade-bootstrap-check`, API 18000,
+исключённый .env. Существующие volumes сохранены, чужой процесс на 8000 не затронут.
+
+| Команда / сценарий | Наблюдаемый результат |
+|---|---|
+| `poetry check` | Успех, зависимости/lock не обновлялись |
+| `poetry run ruff check .`, `poetry run ruff format --check .` | Успех |
+| `docker compose config -q`, `docker compose build api`, `up -d --wait api worker dispatcher mock-a mock-b` | Успех |
+| `docker compose run --rm migrate`, `migrate-mock-a`, `migrate-mock-b`; каждая повторена | Успех; payments 0001, mock A/B mock_0002; прежние данные сохранены |
+| `RUN_INTEGRATION=1 poetry run pytest -q` | 100 passed, 0 skipped |
+| Docker pytest с `RUN_INTEGRATION=1`, `API_URL=http://api:8000` | 100 passed, 0 skipped; повтор итогового образа подтвердил тот же результат |
+| Policy unit | Все результаты на A/B; исчерпание, terminal, pending/unknown/not_found; неверные пары, неактивные состояния, чужой payment/неверный provider, fencing/lease граница |
+| Adapter unit с настоящим локальным HTTP | 23 варианта: канонический envelope, B URL/credential/payload, ошибки полей, malformed JSON, HTTP 201/400/404/500, disconnect, общий timeout |
+| HTTP e2e A success | Одна A succeeded, A ledger=1/321, B create_calls=0 |
+| HTTP e2e A retryable → B success | A/B sequence 1/2, разные UUID/key, A declined/B succeeded, ledger=0/1, сумма B=321 |
+| HTTP e2e оба retryable | Failed, две declined, ledger=0/0 |
+| HTTP e2e terminal A | Failed, одна declined, B calls=0 |
+| HTTP e2e not_charged_final A | B succeeded, ledger=0/1 |
+| Terminal Taskiq repeat для всех пяти сценариев | Доставка и ACK наблюдены в Redis; GET неизменен, новых charge/ledger нет |
+| Повтор отказа, смена fixture на success, иной payload | Старый canonical envelope неизменен; ledger=0; конфликт 409; create_calls=3 |
+| `poetry run python scripts/check_bootstrap.py --api-port 18000` | CONNECT isolation; два HTTP worker; live=200/ready=503 при stop Redis/PostgreSQL; graceful exit 0; restart сохраняет строку |
+| `poetry run python scripts/check_first_payment_runtime.py` | Success и все три отказа сохраняются после restart mock; смена fixture и повтор не меняют финал/ledger; outage A → unknown без B; обычный lookup not_found не меняет unknown и не вызывает B; production controls 404, безопасные логи |
+| CLI `first-success`, `cascade-success`, `all-declined` через demo profile | Все exit 0; ledger 1/0, 0/1, 0/0; сумма успешного списания 123 |
+| `git diff --check` | Успех; commit/amend/push/staging не выполнялись, .gitignore сохранён |
+
+Adapter unit не подменяет финансовое доказательство: его результаты относятся
+только к преобразованию HTTP в доменный результат. Списания в e2e/CLI доказаны
+отдельным HTTP ledger настоящих mock. Обычный not_found проверен также реальным
+mock lookup после outage; автоматического lookup самим worker ещё нет.
+
+Сохранённый routing_snapshot прочитан из payments и используется для выбора
+первого/следующего provider. Изменяемой настройки маршрута в текущем контракте
+нет: модель и CHECK допускают только A → B. Поэтому сценарий изменения такой
+настройки не выполнен. Пользователь подтвердил сохранение фиксированного A → B. Проверены чтение
+snapshot из БД, его сериализация/восстановление, неизменность и выбор B из snapshot;
+изменяемая настройка не вводилась. Это согласованная граница проверки.
+
+Не реализованы и не названы пройденными: автоматическая сверка, DB recovery,
+полная конкурентная идемпотентность, financial fault-matrix, D4–D6,
+финальная проверка чистого checkout на новом volume. Это границы следующих этапов.
+
+
+Финальное уточнение: пользователь выбрал сохранение фиксированного A → B.
+После добавления явного unit-теста неизменности/восстановления snapshot локальный
+полный набор показал **101 passed, 0 skipped**. Итоговые Poetry/Ruff/format и
+`git diff --check` прошли. После изменения контекста логирования повторный
+runtime script также прошёл: устойчивые отказы после restart, not_found/unknown
+без B, production controls и safe logs. Последний Git-коммит остался 27cf53f;
+новый коммит агентом не создавался.
+
+Итоговый Docker pytest с RUN_INTEGRATION=1: **101 passed, 0 skipped**.

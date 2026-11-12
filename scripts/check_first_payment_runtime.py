@@ -55,6 +55,20 @@ def main():
         url = s.provider_a_url + "/charges/by-key/" + key
         original = c.get(url, headers=pa)
         original.raise_for_status()
+        refusals = []
+        for mode in ["declined_retryable", "declined_terminal", "not_charged_final"]:
+            decline_ref = "restart-decline-" + str(uuid4())
+            refs.append(decline_ref)
+            c.put(
+                s.provider_a_url + "/__test/fixtures/" + decline_ref,
+                headers=pa,
+                json={"charge_mode": mode},
+            ).raise_for_status()
+            body = dict(key=str(uuid4()), amount_minor=789, currency="USD", method_ref=decline_ref)
+            response = c.post(s.provider_a_url + "/charges", headers=pa, json=body)
+            response.raise_for_status()
+            assert response.json()["status"] == mode
+            refusals.append((body, response.json()))
         compose("stop", "mock-a")
         try:
             unknown_id, unknown_ref = create()
@@ -66,6 +80,30 @@ def main():
             assert b.json()["create_calls"] == 0
         finally:
             compose("up", "-d", "--wait", "mock-a")
+        absent = c.get(
+            s.provider_a_url + "/charges/by-key/" + unknown["attempts"][0]["id"], headers=pa
+        )
+        assert absent.status_code == 404 and absent.json()["status"] == "not_found"
+        assert c.get(base + "/payments/" + unknown_id, headers=auth).json()["status"] == "unknown"
+        assert (
+            c.get(
+                s.provider_b_url + "/__test/stats", headers=pb, params={"method_ref": unknown_ref}
+            ).json()["create_calls"]
+            == 0
+        )
+        for body, canonical in refusals:
+            lookup = c.get(s.provider_a_url + "/charges/by-key/" + body["key"], headers=pa)
+            assert lookup.json() == canonical
+            c.put(
+                s.provider_a_url + "/__test/fixtures/" + body["method_ref"],
+                headers=pa,
+                json={"charge_mode": "success"},
+            ).raise_for_status()
+            assert c.post(s.provider_a_url + "/charges", headers=pa, json=body).json() == canonical
+            stats = c.get(
+                s.provider_a_url + "/__test/stats", headers=pa, params={"key": body["key"]}
+            ).json()
+            assert stats["ledger_count"] == 0 and stats["create_calls"] == 2
         after = c.get(url, headers=pa)
         assert after.status_code == 200 and after.json() == original.json()
         stats = c.get(s.provider_a_url + "/__test/stats", headers=pa, params={"key": key}).json()
@@ -141,6 +179,8 @@ def main():
         json.dumps(
             dict(
                 restart_lookup="passed",
+                durable_declines_after_restart="passed",
+                ordinary_not_found_without_B="passed",
                 ledger_count=1,
                 unknown_without_B="passed",
                 production_controls="404",

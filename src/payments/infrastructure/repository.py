@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from payments.application.ports import Conflict
-from payments.domain.models import Payment, PaymentAttempt, request_hash
+from payments.domain.models import Payment, PaymentAttempt, cascade_decision, request_hash
 from payments.infrastructure.orm import AttemptRow, OutboxRow, PaymentRow
 
 
@@ -124,7 +124,7 @@ class PaymentRepository:
                 id=key,
                 payment_id=p.id,
                 sequence=1,
-                provider="A",
+                provider=p.routing_snapshot[0],
                 provider_idempotency_key=key,
                 status="created",
                 claim_version=0,
@@ -152,7 +152,7 @@ class PaymentRepository:
             setattr(a, k, getattr(claimed, k))
         return payment_entity(p), claimed
 
-    async def finish(self, attempt, external_id):
+    async def finish(self, attempt, result):
         p, a = await self.locked(attempt.payment_id)
         now = await self.session.scalar(select(func.clock_timestamp()))
         if (
@@ -163,23 +163,55 @@ class PaymentRepository:
             or a.lease_until <= now
         ):
             return False
+        status, next_provider = cascade_decision(payment_entity(p), attempt_entity(a), result)
         finished = attempt_entity(a).finish(
             attempt.claim_version,
             now,
-            external_id,
+            result,
             now + timedelta(seconds=self.settings.reconciliation_deadline_seconds),
             now + timedelta(seconds=1),
         )
         for k in [
             "status",
             "external_id",
+            "error_code",
             "lease_until",
             "updated_at",
             "reconciliation_deadline",
             "next_check_at",
         ]:
             setattr(a, k, getattr(finished, k))
-        entity = payment_entity(p).transition(finished.status, now)
+        # Flush the terminal A before inserting B: partial UNIQUE forbids two active attempts.
+        await self.session.flush()
+        if next_provider:
+            key = uuid4()
+            self.session.add(
+                AttemptRow(
+                    id=key,
+                    payment_id=p.id,
+                    sequence=a.sequence + 1,
+                    provider=next_provider,
+                    provider_idempotency_key=key,
+                    status="created",
+                    claim_version=0,
+                    safe_retry_until=now + timedelta(seconds=self.settings.safe_retry_seconds),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            self.session.add(
+                OutboxRow(
+                    id=uuid4(),
+                    event_type="process_payment",
+                    payment_id=p.id,
+                    payload={"payment_id": str(p.id)},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        entity = payment_entity(p)
+        if entity.status != status:
+            entity = entity.transition(status, now)
         p.status, p.updated_at = entity.status, now
         return True
 

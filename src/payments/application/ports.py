@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from payments.domain.models import Payment, PaymentAttempt
+from payments.domain.models import Payment, PaymentAttempt, ProviderResult
 
 
 class Conflict(Exception):
@@ -14,7 +14,7 @@ class Repository(Protocol):
     async def get(self, identity: UUID, merchant: UUID) -> dict | None: ...
     async def prepare(self, identity: UUID) -> None: ...
     async def claim(self, identity: UUID) -> tuple[Payment, PaymentAttempt] | None: ...
-    async def finish(self, attempt: PaymentAttempt, external_id: UUID | None) -> bool: ...
+    async def finish(self, attempt: PaymentAttempt, result: ProviderResult) -> bool: ...
 
 
 class UoW(Protocol):
@@ -27,4 +27,4 @@ class UoW(Protocol):
 
 
 class Provider(Protocol):
-    async def charge(self, payment: Payment, attempt: PaymentAttempt) -> UUID | None: ...
+    async def charge(self, payment: Payment, attempt: PaymentAttempt) -> ProviderResult: ...

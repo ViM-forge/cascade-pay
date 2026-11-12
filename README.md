@@ -1,9 +1,9 @@
 # Cascade Payments
 
-Первый сквозной платёж: POST → PostgreSQL/outbox → Redis/Taskiq → worker →
-HTTP mock A → GET succeeded. Доступны JWT авторизация, базовая идемпотентность,
-долговечные независимые mock A/B. Каскад, автоматическая сверка unknown и DB recovery
-ещё не реализованы. Реальные деньги не используются.
+Последовательный каскад: POST → PostgreSQL/outbox → Redis/Taskiq → worker →
+HTTP mock A/B → GET с историей попыток. Доступны JWT, базовая идемпотентность,
+устойчивые отказы и независимые ledger mock A/B. Автоматическая сверка unknown
+и DB recovery ещё не реализованы. Реальные деньги не используются.
 
 Нужны Docker Desktop/Engine с Compose v2. Для локальной разработки — Python 3.13
 и Poetry **2.2.1** (для установки командой ниже нужен uv). В Docker: Python 3.13.9, PostgreSQL 17.6, Redis 7.4.6.
@@ -83,7 +83,7 @@ docker compose run --rm -e RUN_INTEGRATION=1 -e API_URL=http://api:8000 api pyte
 python3.13 scripts/check_bootstrap.py
 ```
 
-Без RUN_INTEGRATION два теста настоящих БД/Redis явно пропускаются. DB smoke
+Без RUN_INTEGRATION integration/e2e явно пропускаются. DB smoke
 проверяет уникальности, FK, диапазоны и BIGINT max в откатываемой транзакции.
 Redis smoke оставляет исходное сообщение у умершего consumer и ждёт reclaim
 без новых публикаций и DB recovery. Платёжные e2e отдельно проверяют повтор POST/Taskiq и ledger через HTTP.
@@ -152,3 +152,34 @@ Runtime-проверка подтверждает сохранность опе�
 Unknown пока остаётся unknown; автоматической сверки и восстановления потери
 Redis нет. Поздний ответ после lease не сохраняется. Эти ограничения не дают
 основания повторять платёж с новым клиентским ключом.
+
+
+## Последовательный каскад (D2/D3)
+
+```sh
+docker compose --profile demo run --rm demo cascade-success
+docker compose --profile demo run --rm demo all-declined
+```
+
+D2: A declined → B succeeded, ledger A=0/B=1, сумма B=123. D3: failed,
+две declined attempt, ledger 0/0. Каждая команда использует новые ref/key.
+
+Маршрут A → B сохраняется в routing_snapshot при создании платежа; worker читает
+его из БД. Изменяемой настройки маршрута нет: контракт фиксирует A → B. B получает sequence=2 и собственный UUID/key. Под lock payment → attempt
+отказ A, B created и outbox сохраняются одной транзакцией. Между провайдерами
+нет открытой DB-транзакции. Дубли результата/задачи не создают ещё одну B;
+терминальная задача делает no-op и ACK после commit проверенного no-op.
+
+Переход разрешают только declined_retryable/issuer_unavailable и устойчивая
+not_charged_final. Declined_terminal/invalid_payment_method завершает failed
+без B. Исчерпание маршрута после разрешённых отказов тоже даёт failed.
+Not_charged_final — неизменная операция, запрещающая любое будущее списание по
+ключу; обычный lookup not_found такой гарантии не даёт. Timeout/disconnect,
+pending, невалидный envelope, неизвестный status/error_code и неожиданный
+HTTP-код оставляют unknown без B. HTTP-код сам по себе не бизнес-отказ.
+
+Fixtures success/declined_retryable/declined_terminal/not_charged_final выбираются
+только защищённым test/demo endpoint. Смена fixture действует на новые ключи;
+старые финальные операции неизменны. Счётчики HTTP-вызовов и ledger независимы.
+Обновление существующего окружения требует новой mock-миграции на обеих БД
+(команды migrate-mock-a/migrate-mock-b выше); старая история сохранена.

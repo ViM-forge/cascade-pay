@@ -2,14 +2,12 @@ import logging
 import time
 from uuid import UUID
 
-from sqlalchemy import select
 from taskiq import Context, TaskiqDepends, TaskiqEvents
 
 from payments.application.use_cases import process_payment
 from payments.infrastructure.db import create_engine, session_factory
 from payments.infrastructure.http_provider import HttpProvider
 from payments.infrastructure.logging import configure_logging
-from payments.infrastructure.orm import AttemptRow
 from payments.infrastructure.repository import SqlUoW
 from payments.infrastructure.settings import load_settings
 from payments.infrastructure.stream_broker import PeriodicRedisStreamBroker
@@ -46,23 +44,16 @@ async def shutdown(state):
 @broker.task(task_name="process_payment")
 async def process(payment_id: str, context: Context = TaskiqDepends()):  # noqa: B008
     started = time.monotonic()
-    result = await process_payment(
+    result, attempt_id, provider = await process_payment(
         SqlUoW(context.state.sessions, settings), HttpProvider(settings), UUID(payment_id)
     )
-    async with context.state.sessions() as session:
-        attempt_id = await session.scalar(
-            select(AttemptRow.id)
-            .where(AttemptRow.payment_id == UUID(payment_id))
-            .order_by(AttemptRow.sequence.desc())
-            .limit(1)
-        )
     logging.info(
         "payment processed",
         extra=dict(
             event="payment_processed",
             payment_id=payment_id,
             attempt_id=str(attempt_id) if attempt_id else None,
-            provider="A",
+            provider=provider,
             duration=time.monotonic() - started,
             result=result,
         ),

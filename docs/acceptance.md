@@ -1,6 +1,6 @@
 # Критерии приёмки и будущие проверки
 
-Статус: контракт проверки; D1 реализован и проверен, остальные полные сценарии пока будущие. Фактические результаты отдельно в [verification.md](verification.md). Указанные test IDs — обязательные будущие имена; менять их можно только вместе с этой матрицей. Нормативные [решения](decisions.md) и [HTTP provider contract](provider-contract.md) самодостаточны.
+Статус: контракт проверки; D1–D3 реализованы и проверены, D4–D6 пока будущие. Фактические результаты отдельно в [verification.md](verification.md). Указанные test IDs — обязательные будущие имена; менять их можно только вместе с этой матрицей. Нормативные [решения](decisions.md) и [HTTP provider contract](provider-contract.md) самодостаточны.
 
 ## Метод доказательства
 
@@ -8,13 +8,13 @@ Unit проверяет переходы и часы; integration/e2e испол
 
 ## Шесть демонстраций
 
-D1 доступен по README и фактически запускался. Команды D2–D6 — целевой будущий интерфейс, они ещё не реализованы.
+D1–D3 доступны по README и фактически запускались. Команды D4–D6 — будущий интерфейс.
 
 | ID / сценарий / будущая команда | Контракт и ожидаемый результат | Будущий тест |
 |---|---|---|
 | D1 A success; `docker compose --profile demo run --rm demo first-success` | POST 202; GET succeeded; одна A succeeded с external_id; A ledger_count=1 и ledger_amount_minor=amount, B create_calls=0 | `tests/integration/test_first_payment.py::test_first_success` |
-| D2 A decline → B success; `docker compose --profile demo run --rm demo cascade-success` | A declined_retryable/issuer_unavailable сохранён до создания B; GET succeeded, sequence 1/2; ledger A/B=0/1 | `tests/integration/test_cascade.py::test_retryable_then_success` |
-| D3 оба decline; `docker compose --profile demo run --rm demo all-declined` | два подтверждённых retryable отказа; GET failed, ровно две declined, ledger 0/0; нет третьей попытки | `tests/integration/test_cascade.py::test_all_declined` |
+| D2 A decline → B success; `docker compose --profile demo run --rm demo cascade-success` | A declined_retryable/issuer_unavailable сохранён до создания B; GET succeeded, sequence 1/2; ledger A/B=0/1 | `tests/integration/test_cascade.py::test_cascade_http` |
+| D3 оба decline; `docker compose --profile demo run --rm demo all-declined` | два подтверждённых retryable отказа; GET failed, ровно две declined, ledger 0/0; нет третьей попытки | `tests/integration/test_cascade.py::test_cascade_http` |
 | D4 списание и потеря ответа; `docker compose --profile demo run --rm demo lost-response` | Реальный разрыв после provider commit; наблюдаемый unknown, external_id=NULL; lookup по key → succeeded; A ledger=1, B create_calls=0 | `tests/integration/test_unknown.py::test_charge_then_disconnect` |
 | D5 повтор клиента/задачи; `docker compose --profile demo run --rm demo duplicate-delivery` | 10 одинаковых конкурентных POST → один UUID/202; настоящие дубли Taskiq до/во время/после HTTP; одна A, ledger=1, B calls=0 | `tests/integration/test_concurrency.py::test_duplicate_delivery` |
 | D6 restart; `sh scripts/demo-recovery.sh` | Wrapper останавливает реальный worker на barrier после списания до result commit, перезапускает с теми же данными. Без нового POST тот же payment/attempt/key → succeeded, ledger=1 | `tests/integration/test_recovery.py::test_restart_after_charge` |
@@ -86,3 +86,28 @@ production controls и безопасные логи. Полные G/Q и D2–D
 заменяет recovery D6. Конкретные команды и границы — в verification.md.
 Защита от повторного списания зависит от provider contract и сохранности PostgreSQL;
 exactly-once транспорт, реальный процессинг, SLA и нагрузка не доказаны.
+
+
+## Проверено для последовательного каскада
+
+`tests/integration/test_cascade.py` через настоящий HTTP/API/Redis/Taskiq проверяет
+D1–D3, terminal decline A без B и not_charged_final A → B. Списания доказываются
+HTTP stats независимого ledger: 1/0, 0/1, 0/0; сумма 321 в e2e. Проверяются
+sequence/UUID/key, число outbox, история GET, повтор терминальной задачи,
+повтор отказа и смена fixture, конфликт payload без ledger.
+
+`tests/unit/test_policy.py` проверяет все нормализованные результаты на обеих
+позициях маршрута, запреты для неактивных payment/attempt и неверные пары кодов.
+`tests/unit/test_http_provider.py` проверяет adapter настоящим локальным HTTP:
+полный envelope, B credential/payload, pending/not_found, повреждённый JSON,
+неожиданные HTTP-коды, disconnect и timeout. Это проверка adapter отдельно от
+платёжного e2e; она не объявляется финансовой fault-matrix.
+
+Автоматический lookup/reconciliation не реализован: обычный not_found проверен
+как запрет в policy/adapter, а не как завершённый сценарий автоматической сверки.
+Детали и ограничения фактических запусков — [verification.md](verification.md).
+
+
+Граница snapshot согласована: маршрут остаётся фиксированным A → B, изменяемая
+настройка не добавлена. Проверяются сохранённый JSONB snapshot, round-trip
+доменной модели, запрет изменения и выбор следующего provider из snapshot.

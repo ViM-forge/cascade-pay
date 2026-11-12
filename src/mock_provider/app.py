@@ -79,7 +79,7 @@ class Charge(BaseModel):
 
 class Fixture(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    charge_mode: Literal["success"]
+    charge_mode: Literal["success", "declined_retryable", "declined_terminal", "not_charged_final"]
     lookup_mode: Literal["normal"] = "normal"
     lookup_not_found_count: Literal[0] = 0
     barrier: None = None
@@ -117,16 +117,29 @@ async def charge(body: Charge, request: Request):
             text("INSERT INTO calls(key, method_ref, kind) VALUES(:key,:method_ref,'create')"),
             values,
         )
+        mode = (
+            await c.scalar(
+                text("SELECT charge_mode FROM fixtures WHERE method_ref=:method_ref"), values
+            )
+            or "success"
+        )
+        status, code = {
+            "success": ("succeeded", None),
+            "declined_retryable": ("declined_retryable", "issuer_unavailable"),
+            "declined_terminal": ("declined_terminal", "invalid_payment_method"),
+            "not_charged_final": ("not_charged_final", "not_charged_final"),
+        }[mode]
+        values |= dict(status=status, error_code=code)
         created = (
             await c.execute(
                 text("""INSERT INTO operations
-            (key,external_id,amount_minor,currency,method_ref,request_hash,status)
-            VALUES(:key,:external_id,:amount_minor,:currency,:method_ref,:request_hash,'succeeded')
+            (key,external_id,amount_minor,currency,method_ref,request_hash,status,error_code)
+            VALUES(:key,:external_id,:amount_minor,:currency,:method_ref,:request_hash,:status,:error_code)
             ON CONFLICT(key) DO NOTHING RETURNING external_id"""),
                 values,
             )
         ).scalar()
-        if created:
+        if created and status == "succeeded":
             await c.execute(
                 text("""INSERT INTO ledger(id,operation_id,amount_minor,currency)
                 VALUES(:id,:external_id,:amount_minor,:currency)"""),
@@ -172,9 +185,9 @@ async def fixture(method_ref: str, body: Fixture, request: Request):
         return error("validation_error", 422, fields=["method_ref"])
     async with request.app.state.engine.begin() as c:
         await c.execute(
-            text("""INSERT INTO fixtures VALUES(:ref,'success')
-            ON CONFLICT(method_ref) DO NOTHING"""),
-            {"ref": method_ref},
+            text("""INSERT INTO fixtures VALUES(:ref,:mode)
+            ON CONFLICT(method_ref) DO UPDATE SET charge_mode=excluded.charge_mode"""),
+            {"ref": method_ref, "mode": body.charge_mode},
         )
     return body.model_dump()
 
