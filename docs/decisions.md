@@ -1,6 +1,6 @@
 # Контракты и решения MVP
 
-Статус: контракты приняты; окружение, health и базовая миграция реализованы и проверены — [проверки окружения](verification.md). Success через A и последовательный каскад после подтверждённых разрешённых отказов реализованы; проверки и ограничения — в verification.md. Сверка и DB recovery ещё не реализованы. Нормативный контракт провайдеров: [provider-contract.md](provider-contract.md), критерии будущей проверки: [acceptance.md](acceptance.md).
+Статус: контракты приняты; окружение, health и базовая миграция реализованы и проверены — [проверки окружения](verification.md). Success через A и последовательный каскад после подтверждённых разрешённых отказов реализованы; проверки и ограничения — в verification.md. Ограниченная сверка unknown реализована; общий DB recovery ещё не реализован. Нормативный контракт провайдеров: [provider-contract.md](provider-contract.md), критерии будущей проверки: [acceptance.md](acceptance.md).
 
 ## Объём и архитектура
 
@@ -117,3 +117,51 @@ Manual review: сохранить unknown, marker=true, next_check_at=NULL; ав
 ## Границы гарантий
 
 Защита от повторного списания зависит от долговечной идемпотентности, канонического lookup и невозможности позднего списания после отказа у провайдера. Lease/version защищают локальное состояние, но не отменяют уже отправленный внешний запрос. Mock хранят ключи весь срок данных, безопасное окно отправки ограничено 24 ч; после него только lookup в оставшемся бюджете или ручной разбор. Недоступность зависимостей не имеет обещанного SLA. Реальные платёжные токены не считаются переносимыми между провайдерами.
+
+
+## Реализованные предохранители перед автоматической сверкой
+
+Первая отправка также ограничена safe_retry_until: domain claim отвергает
+now >= safe_retry_until. Repository под lock payment → attempt читает
+clock_timestamp и вместо charge сохраняет unknown, прежний key/window,
+reconciliation deadline/due и reconcile_payment outbox в одной транзакции.
+Домен защищает инвариант claim; repository координирует сохранение перехода.
+Это не дублирование таблицы платёжной политики: каскад не вызывается.
+
+Внешний HTTP envelope допускает только succeeded/declined_retryable/
+declined_terminal/not_charged_final/pending. Unknown/not_found — внутренние
+результаты, не валидные статусы операции HTTP 200. При отклонённом envelope
+external_id не переносится в нормализованный результат.
+
+Publisher различает process_payment и reconcile_payment; второе публикуется
+только при готовности unknown. Дополнительный bounded due-проход читает unknown
+из PostgreSQL независимо от published_at. При активном lease и manual нет HTTP.
+Общий recovery других статусов не добавлен. Новых registry/универсальных движков нет.
+
+
+## Реализация сверки и граница следующего этапа
+
+`Payment.apply_result` и общая cascade_decision применяют одну таблицу результатов
+к processing/in_flight и unknown/unknown. Только подтверждённый финал разрешает
+unknown → failed/processing; прямой перевод unknown в failed по времени запрещён.
+Application закрывает claim UoW до lookup, а при not_found отдельно закрывает
+повторную проверку persisted version/lease/window до charge. Один слот не
+возобновляется повторно после crash; следующий claim расходует новый слот.
+
+Domain хранит count/manual и ограничения backoff/lease/deadline. Infrastructure
+сохраняет snapshot поля и outbox одной транзакцией; результат требует той же
+attempt/status/version, manual=false и lease>clock_timestamp после lock.
+Deadline/count не используются как veto для финала действующего владельца.
+HTTP adapter отдельно валидирует lookup404 (ровно key/status) и canonical200.
+Дубликат до due, при lease, manual или terminal делает no-op и ACK после commit.
+
+Новая mock_0004 добавляет pending и persisted lookup mode/count; payments schema
+0001 оказалась достаточной. Applied migrations не переписывались. Для настоящего
+разрыва выбран test-only TCP proxy, чтобы не зависеть от внутренних Uvicorn
+transport API; исключение ASGI до response start даёт 500, а не потерю ответа
+([source Uvicorn 0.54.0](https://github.com/Kludex/uvicorn/blob/0.54.0/uvicorn/protocols/http/h11_impl.py)).
+Wall-clock HTTP/публикация ограничены asyncio.timeout, а не только socket timeout
+([Python 3.13](https://docs.python.org/3.13/library/asyncio-task.html#asyncio.timeout)).
+Каждый UoW открывает отдельную async-сессию; не разделяем mutable session между
+задачами ([SQLAlchemy 2.0](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html#using-asyncsession-with-concurrent-tasks)).
+Зависимости не обновлялись; гарантии подтверждаются тестами, а не выбором библиотеки.

@@ -98,7 +98,7 @@ services:
       APP_PROFILE: ${APP_PROFILE:-production}
       MOCK_SERVICE_CREDENTIAL: ${MOCK_A_SERVICE_CREDENTIAL}
       DATABASE_URL: postgresql+asyncpg://mock_a:${MOCK_A_DB_PASSWORD}@postgres:5432/mock_a
-    command: ["uvicorn", "mock_provider.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+    command: ["python", "-m", "mock_provider.server"]
     ports: ["127.0.0.1:8001:8000"]
     healthcheck: &mock-health
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=2)"]
@@ -111,7 +111,7 @@ services:
       APP_PROFILE: ${APP_PROFILE:-production}
       MOCK_SERVICE_CREDENTIAL: ${MOCK_B_SERVICE_CREDENTIAL}
       DATABASE_URL: postgresql+asyncpg://mock_b:${MOCK_B_DB_PASSWORD}@postgres:5432/mock_b
-    command: ["uvicorn", "mock_provider.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+    command: ["python", "-m", "mock_provider.server"]
     ports: ["127.0.0.1:8002:8000"]
     healthcheck: *mock-health
 

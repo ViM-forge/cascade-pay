@@ -207,3 +207,210 @@ ON CONFLICT/SELECT протокола. Provider idempotency не заменяе�
 реальный provider и финальная проверка чистого checkout не реализованы и не
 объявлены пройденными. Это согласованные границы последующих этапов.
 Актуальных подтверждённых нерешённых проблем не выявлено — [known issues](known-issues.md).
+
+
+## Текущая валидация перед сверкой unknown — 2026-11-12
+
+Это новый запуск baseline, отдельно от исторических результатов выше. Реализация
+автоматической сверки ещё не добавлена. HEAD на старте: 3157f5a; рабочее дерево
+было чистым. Коммиты/публикации агент не выполнял.
+
+Окружение проверено: Poetry 2.2.1, host Python 3.13.13 / Docker Python 3.13.9,
+PostgreSQL 17.6 / READ COMMITTED, Redis 7.4.6. Python packages:
+FastAPI 0.162.4, Pydantic 2.14.3, SQLAlchemy 2.0.57, asyncpg 0.32.0,
+Alembic 1.20.1, Taskiq 0.13.0, taskiq-redis 1.2.4, redis client 8.1.0,
+httpx 0.28.1, Uvicorn 0.54.0, uvicorn-worker 0.4.0, pytest 8.4.2, Ruff 0.14.14.
+Версии прочитаны из установленных пакетов; зависимости не обновлялись.
+
+Compose project cascade-bootstrap-check: семь сервисов healthy, API на 18000.
+Через compose top подтверждены два отдельных дочерних worker-процесса.
+Оба существующих PostgreSQL volume сохранены. При чтении было 9 unknown и
+12 in_flight; их не чистили и не меняли статусы. Порт 8000 занят чужим Python,
+он не останавливался.
+
+| Фактически выполнено | Результат |
+|---|---|
+| poetry check | exit 0 |
+| poetry run ruff check . | exit 0 |
+| poetry run ruff format --check . | exit 0, 47 файлов |
+| docker compose config -q | exit 0 |
+| poetry run alembic upgrade head, два раза | exit 0, revision 0001 |
+| docker compose exec -T mock-a alembic -c mock_alembic.ini upgrade head, два раза | exit 0, mock_0003 |
+| То же для mock-b | exit 0, mock_0003 |
+| RUN_INTEGRATION=1 API_URL=http://127.0.0.1:18000 poetry run pytest -q | 123 passed, 0 skipped, 21.44s |
+| docker compose run --rm -e RUN_INTEGRATION=1 -e API_URL=http://api:8000 api pytest -q | 123 passed, 0 skipped, 23.48s |
+| docker compose --profile demo run --rm demo first-success | exit 0, A/B ledger 1/0, amounts 123/0 |
+| … demo cascade-success | exit 0, ledger 0/1, amounts 0/123 |
+| … demo all-declined | exit 0, failed, ledger 0/0 |
+| … demo duplicate-delivery | exit 0, 10 POST, один payment/attempt, ledger 1/0, create_calls 1/0 |
+| git diff --check после правки EOF новой записи | exit 0 |
+
+Независимые воспроизведения выявили два дефекта, не покрытых этим baseline:
+[KI-01/KI-02](known-issues.md). Настоящий локальный HTTP 200 с полным envelope
+status=not_found/unknown был принят адаптером с external_id. В отдельной
+откатываемой DB-транзакции created с истёкшим safe_retry_until получила in_flight
+claim; HTTP в этом воспроизведении не вызывался. Обнаруживший агент по правилам
+не исправлял дефекты, запросил передачу. Все проверки baseline прошли на прежнем
+коде; добавлены только записи документации.
+
+Новые fixtures/resolve, bounded reconciliation, её due-dispatch и D4 lost-response
+ещё не реализованы и не проверены. Проверки финансовых исходов unknown, окна
+повтора, бюджета/пятого владельца, restart/manual из нового объёма не выполнены.
+Причина: зависимая работа ожидает передачи подтверждённых дефектов и решения по
+настоящему disconnect. Runtime smoke со stop/restart сервисов в этом запуске не
+повторяли; результаты прежних запусков выше остаются историческими.
+
+
+## Исправления после независимой валидации — 2026-11-12
+
+Пользователь поручил исправлять выявленные проблемы другими агентами. KI-01 и
+KI-02 исправлены отдельными агентами; третий read-only reviewer выявил KI-03
+на стыке нового outbox producer и publisher. Его исправил другой агент.
+Root прочёл diff, независимо повторил HTTP-тесты и полный набор. Итоговый review
+не выявил новых подтверждённых нарушений SOLID/DRY/YAGNI. После проверки KI-01–03
+удалены из known-issues; правила документа сохранены.
+
+| Выполненная команда/проверка | Результат |
+|---|---|
+| poetry run pytest -q tests/unit/test_http_provider.py | 26 passed, 0.50s |
+| poetry check | exit 0 |
+| poetry run ruff check . | exit 0 |
+| poetry run ruff format --check . | exit 0, 50 файлов |
+| git diff --check | exit 0 |
+| RUN_INTEGRATION=1 API_URL=http://127.0.0.1:18000 poetry run pytest -q | 138 passed, 0 skipped, 20.91s |
+| docker compose build | exit 0 |
+| docker compose up -d --wait api worker dispatcher mock-a mock-b | exit 0, healthy |
+| docker compose run --rm -e RUN_INTEGRATION=1 -e API_URL=http://api:8000 api pytest -q | 138 passed, 0 skipped, 23.68s |
+
+Новые 15 регрессий: три HTTP envelope case, семь unit window case,
+три DB/application case окна, два DB/transport-boundary case publisher.
+Граница доказательства: HTTP-adapter тестируется настоящим локальным HTTP;
+окно/атомарность/время после lock — реальным PostgreSQL и дополнительным
+application test без provider вызова. Publisher тест использует PostgreSQL
+временную таблицу и подмену публикации на границе транспорта. Финансовые
+success/cascade/idempotency e2e через настоящий HTTP/Redis/Taskiq остаются
+в полном наборе. Эти проверки не являются e2e автоматической сверки.
+
+Миграции и зависимости не менялись. PostgreSQL/Redis не останавливались,
+старые unknown/in_flight и provider ledger не чистились. Новые DB-тесты либо
+откатывают свои записи, либо удаляют только собственные UUID fixture без
+операций провайдера. .env/.gitignore/volumes и Git HEAD сохранены; commit,
+amend, push и staging не выполнялись.
+
+Предохранители готовы: недопустимый charge envelope не сохраняет external_id;
+просроченная первая отправка сохраняет unknown/reconcile outbox без charge;
+неподдерживаемый reconcile остаётся unpublished. Автоматическая сверка, D4,
+новые mock modes/resolve и обязательные граничные проверки сверки пока не
+реализованы. Способ настоящего disconnect остаётся открытым выбором;
+готовность шага 6 и переход к шагу 7 не заявляются.
+
+
+После обновления образа последовательно повторены CLI:
+
+- docker compose --profile demo run --rm demo first-success — succeeded,
+  ledger A/B 1/0, amounts 123/0.
+- docker compose --profile demo run --rm demo cascade-success — succeeded,
+  ledger 0/1, amounts 0/123.
+- docker compose --profile demo run --rm demo all-declined — failed,
+  две declined, ledger 0/0.
+- docker compose --profile demo run --rm demo duplicate-delivery — succeeded,
+  10 POST, одна attempt, ledger 1/0, create_calls 1/0.
+
+Все четыре команды завершились успешно. Итоговый docker compose ps — семь
+healthy сервисов; git diff --check — exit 0. Runtime/bootstrap со специальными
+stop/restart failpoints в этой итерации не повторяли. Git HEAD по-прежнему
+3157f5a; новые test-файлы остаются untracked для пользовательского коммита.
+
+
+## Текущий этап: ограниченная сверка unknown — 2026-11-12
+
+Проверено незакоммиченное рабочее состояние поверх HEAD3157f5a, отдельно от всех
+исторических разделов выше. Зависимости/.env/.gitignore и старые volumes сохранены.
+Актуальные payments revision0001, mock A/B mock_0004. Новая mock0004 применена
+на каждой БД; команды migrate/migrate-mock-a/migrate-mock-b повторены успешно.
+Сборка и up --wait api/worker/dispatcher/mock-a/mock-b завершились успешно.
+
+| Команда/проверка | Наблюдаемый результат |
+|---|---|
+| poetry check | exit0 |
+| poetry run ruff check . | exit0 |
+| poetry run ruff format --check . | exit0, 61 файлов |
+| git diff --check | exit0 |
+| poetry run pytest -q tests/unit/test_http_provider.py tests/unit/test_lookup_provider.py | 41 passed, 0.55s |
+| RUN_INTEGRATION=1 API_URL=http://127.0.0.1:18000 poetry run pytest -q tests/integration/test_unknown.py -x | 10 passed, 59.55s; до добавления отдельного Taskiq due/lease теста |
+| RUN_INTEGRATION=1 API_URL=http://127.0.0.1:18000 poetry run pytest -q | 259 passed, 0 skipped, 86.63s; включая добавленный due/lease тест и KI04 |
+| poetry run python scripts/check_reconciliation_runtime.py | exit0; unknown/manual, count5, nextNULL, lookup5/create1, ledger0/0; restart worker/dispatcher/A/B сохраняет DB snapshot; 8 resolved finals A/B canonical/ledger сохранены |
+
+Финансовые e2e выполняют настоящий POST/GET/fixtures/resolve/stats по HTTP,
+публикуют настоящие Taskiq задачи и наблюдают PostgreSQL/Redis/два worker.
+D4 helper гарантирует промежуточный unknown/null external_id: lookup временно
+недоступен до наблюдения unknown, затем разрешён. TCP proxy действительно
+закрывает клиентское соединение после commit, без HTTP bytes; адаптер даёт
+unknown, canonical lookup находит единственный ledger. B не вызывается.
+
+Остальные e2e: pending resolve во все4 финала, malformed/5xx→unknown,
+временный404 при существующем success→тот же charge key/ledger1,
+timeout до operation с reached before barrier→lookup404→повтор старого key,
+release→одна attempt/ledger1. Бюджет проверен пятью настоящими lookup без
+ускорения production таймингов; ручной marker не оживает после restart.
+Taskiq до due/при lease проверен отдельным тестом с управлением только timing
+полями собственного payment; это не имитация финансового ответа или blind fix
+производственных статусов. Исходные неизвестные платежи не чистились. Due unknown
+теперь обрабатываются протоколом сверки/лимитов; expired in_flight не сканируются.
+
+Дополнительные unit/DB/application тесты контролируют точные границы окна,
+lease/deadline, время после ожидания row lock, foreign/stale/expired/manual result,
+право пятого действующего владельца сохранить финал после deadline и atomic
+lookup decline/B/outbox. Transport-boundary tests используют TEMP DB таблицы и
+mock только публикации, отдельно от финансовых e2e. Provider HTTP tests проверяют
+на A/B настоящий disconnect, malformed/503, resolve, точный persisted counter
+при8 конкурентных lookup и canonical repeat после смены fixture на barrier.
+
+Обнаруженный reviewer KI04 исправлен другим агентом и прошёл6 реальных HTTP
+регрессий в полном наборе. После проверки удалён из known issues; актуальных
+подтверждённых проблем нет. Новых подтверждённых SOLID/DRY/YAGNI нарушений
+независимый review не нашёл. Лишних слоёв/registry/движков не добавлялось.
+
+Не выполняются в этом этапе: общий recovery pending/created/expired in_flight,
+Redis-loss recovery, D6, полная combined fault-matrix, нагрузка/реальные деньги,
+финальный clean checkout. Это границы шагов7–9, не скрытые пройденные проверки.
+Ни один skipped не объявлялся passed. Docker полный прогон и текущие CLI/runtime
+результаты будут добавлены отдельным продолжением после завершения команд.
+
+
+### Итог текущих e2e/CLI/runtime запусков
+
+- Docker полный набор: `docker compose run --rm -e RUN_INTEGRATION=1
+  -e API_URL=http://api:8000 api pytest -q` — **259 passed, 0 skipped, 88.33s**.
+- Все пять `docker compose --profile demo run --rm demo <scenario>` выполнены
+  последовательно с проверкой exit code: first-success, cascade-success,
+  all-declined, duplicate-delivery, lost-response — exit0.
+  Ledger1/0,0/1,0/0,1/0,1/0. D4 вывел intermediate_status=unknown,
+  intermediate_external_id=null → succeeded, lookup1/create1, Bcalls0.
+- `poetry run python scripts/check_idempotency_runtime.py` — exit0,
+  queued before HTTP3, разные worker PID6/7, ledger0/1 и createcalls1/1,
+  concurrent mock restart passed.
+- Первый `check_first_payment_runtime.py` упал на старом assert404 после restore A:
+  новая сверка уже успела корректно разрешить unknown. Это KI05 verifier,
+  а не подтверждение финансового дефекта. Другой агент обновил ожидание на
+  тот же payment/attempt/key → succeeded + independent ledger. Повтор
+  `poetry run python scripts/check_first_payment_runtime.py` — exit0:
+  observed unknown при недоступном A, затем тот же key/ledger1/789, B0;
+  canonical finals после restart, production controls включая resolve404,
+  проверенные JWT/секреты/ref отсутствуют в логах. KI05 удалён из known issues
+  после успешного повтора; причины остались в документации/истории проверок.
+- Подтверждены два независимых дочерних worker-процесса через compose top.
+  Оба прежних volume сохранены, порт8000 чужого Python не трогали.
+
+Эти runtime запуски выполнялись последовательно после pytest; остановок нужных
+сервисов одновременно с тестами не было. После изменения только smoke verifier
+259 тестов не прогоняли повторно без причины: платёжный код/схема не менялись,
+сам исправленный smoke повторён реально. Образ после script change пересобран.
+
+
+Финальная пересборка и `poetry run python scripts/check_bootstrap.py --api-port 18000`
+прошли exit0: role isolation, live/ready, два HTTP worker; при stop Redis/PostgreSQL
+live200/ready503; все application containers graceful exit0; restart сохранил
+существующий volume и собственную sentinel row (после проверки удалена только она).
+Запуск был после всех pytest/CLI/runtime, без конкурирующих тестов/остановок.
+Новый source не менялся после259/259, пересборка включила исправленный smoke script.

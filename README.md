@@ -2,8 +2,8 @@
 
 Последовательный каскад: POST → PostgreSQL/outbox → Redis/Taskiq → worker →
 HTTP mock A/B → GET с историей попыток. Доступны JWT, конкурентная идемпотентность,
-устойчивые отказы и независимые ledger mock A/B. Автоматическая сверка unknown
-и DB recovery ещё не реализованы. Реальные деньги не используются.
+устойчивые отказы, независимые ledger mock A/B и ограниченная сверка unknown.
+Общий DB recovery ещё не реализован. Реальные деньги не используются.
 
 Нужны Docker Desktop/Engine с Compose v2. Для локальной разработки — Python 3.13
 и Poetry **2.2.1** (для установки командой ниже нужен uv). В Docker: Python 3.13.9, PostgreSQL 17.6, Redis 7.4.6.
@@ -51,7 +51,7 @@ volume; `docker compose down` тоже сохраняет его. Не испо�
 
 API: Gunicorn запускает два `uvicorn_worker.UvicornWorker` без preload. Каждый
 процесс создаёт engine/pool в FastAPI lifespan и освобождает при остановке.
-Taskiq запускает два независимых worker-процесса (по одной активной async-задаче); dispatcher — отдельный процесс того же образа; dispatcher публикует неопубликованный outbox с ограниченным timeout, затем отмечает published_at. Сессия SQLAlchemy создаётся отдельно для будущей единицы работы
+Taskiq запускает два независимых worker-процесса (по одной активной async-задаче); dispatcher — отдельный процесс того же образа; dispatcher публикует неопубликованный outbox с ограниченным timeout, затем отмечает published_at. Сессия SQLAlchemy создаётся отдельно для каждой единицы работы
 (UoW — одной операции с общей транзакцией), общих глобальных сессий нет.
 Ready проверяет PostgreSQL и Redis; live — только процесс. Mock для ready API
 не требуются. Порты опубликованы только на loopback.
@@ -149,8 +149,8 @@ poetry run python scripts/check_first_payment_runtime.py
 Runtime-проверка подтверждает сохранность операции/ledger после restart, unknown
 при недоступном A без вызова B, 404 controls вне demo/test и отсутствие проверяемых
 секретов/ref в логах. Для Docker pytest задайте API_URL=http://api:8000.
-Unknown пока остаётся unknown; автоматической сверки и восстановления потери
-Redis нет. Поздний ответ после lease не сохраняется. Эти ограничения не дают
+Unknown автоматически сверяется по сохранённому provider key. Восстановления
+expired in_flight и потери Redis пока нет. Поздний ответ после lease не сохраняется. Эти ограничения не дают
 основания повторять платёж с новым клиентским ключом.
 
 
@@ -204,7 +204,7 @@ fixture barrier=before_charge_commit или after_charge_commit_before_response,
 GET /__test/barriers/{key}, POST /__test/barriers/{key}/release с `{}`.
 Обе точки ждут без открытой транзакции, состояние переживает restart mock.
 Ожидание ограничено 30 с; тест ждёт reached=true и освобождает в finally.
-Реализованы только синхронизация и ранее доступные fixtures, без новых fault modes.
+Доступны также fault modes и resolve, описанные в provider-contract.md.
 
 Дополнительные host-only проверки (запускать **последовательно**, отдельно от pytest):
 
@@ -226,3 +226,60 @@ ON CONFLICT DO NOTHING при READ COMMITTED и отдельный SELECT чит
 пересмотра этого протокола. Provider key — сохранённый UUID попытки; HTTP-повторы
 могут увеличить create_calls, но не ledger. Provider idempotency защищает операцию,
 а claim/lease/version координируют worker и защищают локальное состояние.
+
+
+## Защита границы перед сверкой
+
+HTTP-adapter принимает только пять канонических статусов операции провайдера;
+внутренние unknown/not_found в HTTP 200 дают unknown без external_id.
+Обычный not_found относится только к lookup 404, а не к charge-ответу.
+
+Окно safe_retry_until ограничивает и первую отправку. Задержавшаяся created
+при now >= safe_retry_until атомарно становится unknown с прежним key,
+deadline/due и reconcile-outbox, без charge и без B. Время БД проверяется
+после блокировки payment → attempt. Дубль не создаёт новую попытку/событие.
+Dispatcher публикует process_payment и due reconcile_payment; расписание
+сверки хранится в PostgreSQL и проверяется worker повторно.
+
+
+## Потерянный ответ и ограниченная сверка (D4)
+
+```sh
+docker compose --profile demo run --rm demo lost-response
+# Host-only; запускайте отдельно от pytest и других runtime smoke:
+poetry run python scripts/check_reconciliation_runtime.py
+```
+
+D4 сначала получает наблюдаемый unknown с external_id=null после настоящего
+разрыва TCP уже после commit провайдера, затем разрешает lookup и проверяет
+succeeded: одна attempt A, ledger=1/123, create_calls=1, B calls=0.
+Test/demo mock используют TCP front на 8000 и backend только на loopback;
+в production launcher запускает Uvicorn напрямую. Proxy потребляет внутренний
+post-commit marker и не отправляет клиенту ни status line, ни тело ответа.
+
+Unknown не разрешает B. Lookup выполняется по сохранённому key без external_id.
+Обычный not_found не означает отказ; только до safe_retry_until разрешён максимум
+один charge в цикле с прежними UUID/key/payload. Pending и ошибка lookup charge
+не вызывают. Not_charged_final — устойчивая финальная запись с запретом будущего
+списания: в отличие от 404 она разрешает каскад. Policy process/reconcile общая.
+
+До lookup коммитятся lease/version и check_count. Первая проверка через 1с,
+затем 2/4/8/16с от результата, максимум пять проверок и deadline 60с от первого
+unknown. Действующий владелец пятой проверки может сохранить финал после deadline,
+пока lease действует; просроченный или чужой ответ не сохраняется. При исчерпании
+платёж остаётся unknown/manual, next_check_at=NULL; новых HTTP и B нет. Перезапуск
+не сбрасывает счётчик, deadline, окно повтора или manual marker.
+
+Dispatcher выбирает due unknown без действующего lease, включая исчерпанные
+независимо от due. Публикация имеет timeout; publish-before-mark сохранён.
+При сбое событие/due остаётся доступно следующему проходу. Это только сверка
+unknown; общий scan pending/created/expired in_flight и Redis-loss recovery
+остаются будущим объёмом. Taskiq manual ACK — после commit либо проверенного
+no-op. Независимый periodic reclaim сохранён.
+
+Ручной разбор: собрать payment/attempt/provider/key из защищённого хранилища,
+сопоставить canonical lookup с независимым provider ledger и данными запроса.
+Не менять статусы SQL вслепую и не повторять неизвестный платёж с новым клиентским
+ключом: это создаст другое намерение списания. Время ожидания не доказывает отказ.
+Финансового endpoint ручного разрешения нет; manual marker сам не снимается.
+HTTP calls считают обращения, ledger считает списания — эти числа различаются.

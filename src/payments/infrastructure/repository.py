@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
 from payments.application.ports import Conflict
-from payments.domain.models import Payment, PaymentAttempt, cascade_decision, request_hash
+from payments.domain.models import Payment, PaymentAttempt, request_hash
 from payments.infrastructure.orm import AttemptRow, OutboxRow, PaymentRow
 
 
@@ -17,9 +17,27 @@ def attempt_entity(row):
     return PaymentAttempt(**{k: getattr(row, k) for k in PaymentAttempt.model_fields})
 
 
+def store_attempt(row, entity):
+    # Explicit entity/ORM boundary; callers hold payment then attempt row locks.
+    for name, value in entity.model_dump().items():
+        setattr(row, name, value)
+
+
 class PaymentRepository:
     def __init__(self, session, settings):
         self.session, self.settings = session, settings
+
+    def enqueue(self, event_type, payment_id, now):
+        self.session.add(
+            OutboxRow(
+                id=uuid4(),
+                event_type=event_type,
+                payment_id=payment_id,
+                payload={"payment_id": str(payment_id)},
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
     async def create(self, payment, key):
         values = payment.model_dump() | dict(
@@ -36,16 +54,7 @@ class PaymentRepository:
             .returning(PaymentRow.id)
         )
         if inserted:
-            self.session.add(
-                OutboxRow(
-                    id=uuid4(),
-                    event_type="process_payment",
-                    payment_id=payment.id,
-                    payload={"payment_id": str(payment.id)},
-                    created_at=payment.created_at,
-                    updated_at=payment.created_at,
-                )
-            )
+            self.enqueue("process_payment", payment.id, payment.created_at)
             return payment
         # READ COMMITTED: DO NOTHING may wait for a concurrent winner. The next
         # statement gets a fresh snapshot; no failed INSERT/aborted transaction.
@@ -151,12 +160,59 @@ class PaymentRepository:
             # No HTTP for terminal, active lease or unknown/expired in-flight.
             # Recovery/reconciliation will be introduced separately.
             return None
+        if now >= a.safe_retry_until:
+            # The time is read after both locks. A late initial delivery must
+            # persist lookup work rather than send charge outside the saved window.
+            expired = attempt_entity(a).expire_before_send(
+                now,
+                now + timedelta(seconds=self.settings.reconciliation_deadline_seconds),
+                now + timedelta(seconds=1),
+            )
+            store_attempt(a, expired)
+            if p.status != "unknown":
+                entity = payment_entity(p).transition("unknown", now)
+                p.status, p.updated_at = entity.status, now
+            self.enqueue("reconcile_payment", p.id, now)
+            return None
         claimed = attempt_entity(a).claim(
             now, now + timedelta(seconds=self.settings.lease_seconds)
         )
-        for k in ["status", "claim_version", "lease_until", "updated_at"]:
-            setattr(a, k, getattr(claimed, k))
+        store_attempt(a, claimed)
         return payment_entity(p), claimed
+
+    async def claim_reconciliation(self, identity):
+        p, a = await self.locked(identity)
+        if p is None or p.status != "unknown" or a is None:
+            return None
+        now = await self.session.scalar(select(func.clock_timestamp()))
+        entity = attempt_entity(a)
+        action = entity.reconciliation_action(now, self.settings.reconciliation_max_checks)
+        if action == "noop":
+            return None
+        if action == "manual":
+            store_attempt(
+                a, entity.stop_reconciliation(now, self.settings.reconciliation_max_checks)
+            )
+            p.updated_at = now
+            return None
+        claimed = entity.claim_reconciliation(
+            now,
+            now + timedelta(seconds=self.settings.lease_seconds),
+            self.settings.reconciliation_max_checks,
+        )
+        store_attempt(a, claimed)
+        return payment_entity(p), claimed
+
+    async def can_retry(self, attempt):
+        p, a = await self.locked(attempt.payment_id)
+        now = await self.session.scalar(select(func.clock_timestamp()))
+        return (
+            p is not None
+            and p.status == "unknown"
+            and a is not None
+            and a.id == attempt.id
+            and attempt_entity(a).may_retry_charge(attempt.claim_version, now)
+        )
 
     async def finish(self, attempt, result):
         p, a = await self.locked(attempt.payment_id)
@@ -164,29 +220,20 @@ class PaymentRepository:
         if (
             a is None
             or a.id != attempt.id
-            or a.status != "in_flight"
-            or a.claim_version != attempt.claim_version
-            or a.lease_until <= now
+            or a.status != attempt.status
+            or not attempt_entity(a).owns_result(attempt.claim_version, now)
         ):
             return False
-        status, next_provider = cascade_decision(payment_entity(p), attempt_entity(a), result)
+        payment, next_provider = payment_entity(p).apply_result(attempt_entity(a), result, now)
         finished = attempt_entity(a).finish(
             attempt.claim_version,
             now,
             result,
             now + timedelta(seconds=self.settings.reconciliation_deadline_seconds),
             now + timedelta(seconds=1),
+            self.settings.reconciliation_max_checks,
         )
-        for k in [
-            "status",
-            "external_id",
-            "error_code",
-            "lease_until",
-            "updated_at",
-            "reconciliation_deadline",
-            "next_check_at",
-        ]:
-            setattr(a, k, getattr(finished, k))
+        store_attempt(a, finished)
         # Flush the terminal A before inserting B: partial UNIQUE forbids two active attempts.
         await self.session.flush()
         if next_provider:
@@ -205,20 +252,10 @@ class PaymentRepository:
                     updated_at=now,
                 )
             )
-            self.session.add(
-                OutboxRow(
-                    id=uuid4(),
-                    event_type="process_payment",
-                    payment_id=p.id,
-                    payload={"payment_id": str(p.id)},
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-        entity = payment_entity(p)
-        if entity.status != status:
-            entity = entity.transition(status, now)
-        p.status, p.updated_at = entity.status, now
+            self.enqueue("process_payment", p.id, now)
+        if finished.status == "unknown" and not finished.manual_review_required:
+            self.enqueue("reconcile_payment", p.id, now)
+        p.status, p.updated_at = payment.status, now
         return True
 
 

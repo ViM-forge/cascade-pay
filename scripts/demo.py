@@ -18,6 +18,13 @@ def run(scenario):
 
         print(json.dumps(asyncio.run(run_duplicate())))
         return
+    if scenario == "lost-response":
+        import asyncio
+
+        from lost_response import run_lost_response
+
+        print(json.dumps(asyncio.run(run_lost_response())))
+        return
     settings = load_settings()
     modes = {
         "first-success": ("success", "success"),
@@ -100,6 +107,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "scenario",
-        choices=["first-success", "cascade-success", "all-declined", "duplicate-delivery"],
+        choices=[
+            "first-success",
+            "cascade-success",
+            "all-declined",
+            "duplicate-delivery",
+            "lost-response",
+        ],
     )
     run(parser.parse_args().scenario)

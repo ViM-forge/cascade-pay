@@ -45,3 +45,26 @@ async def process_payment(
         saved = await uow.payments.finish(attempt, result)
         await uow.commit()
     return result.status if saved else "stale", attempt.id, attempt.provider
+
+
+async def reconcile_payment(
+    uow: UoW, provider: Provider, identity: UUID
+) -> tuple[str, UUID | None, str | None]:
+    async with uow:
+        claimed = await uow.payments.claim_reconciliation(identity)
+        await uow.commit()
+    if claimed is None:
+        return "noop", None, None
+    payment, attempt = claimed
+    result = await provider.lookup(payment, attempt)
+    if result.status == "not_found":
+        # Commit/close this short recheck before the possible second HTTP call.
+        async with uow:
+            allowed = await uow.payments.can_retry(attempt)
+            await uow.commit()
+        if allowed:
+            result = await provider.charge(payment, attempt)
+    async with uow:
+        saved = await uow.payments.finish(attempt, result)
+        await uow.commit()
+    return result.status if saved else "stale", attempt.id, attempt.provider

@@ -99,8 +99,10 @@ async def run_duplicate():
                         s.provider_a_url + "/__test/stats", headers=pa, params={"key": attempt}
                     )
                 ).json()
-                expected_calls = int(point == "after_charge_commit_before_response")
-                assert stats["create_calls"] == stats["ledger_count"] == expected_calls
+                # A valid HTTP request is counted before either barrier; only
+                # the after-commit barrier already has a financial ledger row.
+                assert stats["create_calls"] == 1
+                assert stats["ledger_count"] == int(point == "after_charge_commit_before_response")
                 (
                     await c.post(
                         s.provider_a_url + "/__test/barriers/" + attempt + "/release",

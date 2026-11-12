@@ -6,8 +6,8 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, field_validator
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -80,10 +80,29 @@ class Charge(BaseModel):
 
 class Fixture(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    charge_mode: Literal["success", "declined_retryable", "declined_terminal", "not_charged_final"]
-    lookup_mode: Literal["normal"] = "normal"
-    lookup_not_found_count: Literal[0] = 0
+    charge_mode: Literal[
+        "success",
+        "declined_retryable",
+        "declined_terminal",
+        "not_charged_final",
+        "pending",
+        "charge_then_disconnect",
+        "timeout_before_result",
+        "malformed_response",
+        "http_5xx",
+    ]
+    lookup_mode: Literal["normal", "temporary_not_found", "unavailable"] = "normal"
+    lookup_not_found_count: int = Field(default=0, strict=True, ge=0, le=2147483647)
     barrier: Literal["before_charge_commit", "after_charge_commit_before_response"] | None = None
+
+
+OPERATION_CODES = {
+    "succeeded": None,
+    "declined_retryable": "issuer_unavailable",
+    "declined_terminal": "invalid_payment_method",
+    "not_charged_final": "not_charged_final",
+    "pending": None,
+}
 
 
 def envelope(row):
@@ -101,6 +120,14 @@ def envelope(row):
     }
 
 
+def payload_conflicts(row, body, fingerprint):
+    return row["request_hash"] != fingerprint or (
+        row["amount_minor"],
+        row["currency"],
+        row["method_ref"],
+    ) != (body.amount_minor, body.currency, body.method_ref)
+
+
 @app.get("/health/live")
 @app.get("/health/ready")
 async def health():
@@ -114,34 +141,40 @@ async def charge(body: Charge, request: Request):
         request_hash=request_hash(body.amount_minor, body.currency, body.method_ref),
     )
     engine = request.app.state.engine
-    async with engine.connect() as c:
-        point = (
-            await c.scalar(
-                text("SELECT barrier FROM fixtures WHERE method_ref=:method_ref"), values
-            )
-            if request.app.state.settings.app_profile in {"test", "demo"}
-            else None
-        )
-    if point == "before_charge_commit":
-        await wait_barrier(engine, body.key, point)
+    test_profile = request.app.state.settings.app_profile in {"test", "demo"}
+    # Count authenticated requests independently of the financial transaction and
+    # before a timeout barrier, including requests whose client disconnects.
     async with engine.begin() as c:
         await c.execute(
             text("INSERT INTO calls(key, method_ref, kind) VALUES(:key,:method_ref,'create')"),
             values,
         )
-        mode = (
-            await c.scalar(
-                text("SELECT charge_mode FROM fixtures WHERE method_ref=:method_ref"), values
-            )
-            or "success"
+    async with engine.connect() as c:
+        existing = (
+            (await c.execute(text("SELECT * FROM operations WHERE key=:key"), values))
+            .mappings()
+            .one_or_none()
         )
-        status, code = {
-            "success": ("succeeded", None),
-            "declined_retryable": ("declined_retryable", "issuer_unavailable"),
-            "declined_terminal": ("declined_terminal", "invalid_payment_method"),
-            "not_charged_final": ("not_charged_final", "not_charged_final"),
-        }[mode]
-        values |= dict(status=status, error_code=code)
+        # Durable operations win before any fixture/barrier. Repeats must remain
+        # canonical even when controls now select a timeout or a different mode.
+        if existing:
+            if payload_conflicts(existing, body, values["request_hash"]):
+                return error("idempotency_conflict", 409)
+            return envelope(existing)
+        fixture_row = (
+            (await c.execute(text("SELECT * FROM fixtures WHERE method_ref=:method_ref"), values))
+            .mappings()
+            .one_or_none()
+        )
+    mode = fixture_row["charge_mode"] if fixture_row and test_profile else "success"
+    point = fixture_row["barrier"] if fixture_row and test_profile else None
+    if mode == "timeout_before_result":
+        point = "before_charge_commit"
+    if point == "before_charge_commit":
+        await wait_barrier(engine, body.key, point)
+    async with engine.begin() as c:
+        status = mode if mode in OPERATION_CODES else "succeeded"
+        values |= dict(status=status, error_code=OPERATION_CODES[status])
         created = (
             await c.execute(
                 text("""INSERT INTO operations
@@ -162,22 +195,25 @@ async def charge(body: Charge, request: Request):
             .mappings()
             .one()
         )
-        conflict = row["request_hash"] != values["request_hash"] or (
-            row["amount_minor"],
-            row["currency"],
-            row["method_ref"],
-        ) != (
-            body.amount_minor,
-            body.currency,
-            body.method_ref,
-        )
+        conflict = payload_conflicts(row, body, values["request_hash"])
     if point == "after_charge_commit_before_response":
         await wait_barrier(engine, body.key, point)
-    return error("idempotency_conflict", 409) if conflict else envelope(row)
+    if conflict:
+        return error("idempotency_conflict", 409)
+    # Only the initial request applies the fault; durable final operations never
+    # re-run a fixture. The private marker is consumed by the loopback TCP proxy.
+    if created and mode == "charge_then_disconnect":
+        return Response(headers={"X-Mock-Disconnect": "after-commit"})
+    if created and mode == "malformed_response":
+        return Response(content="{invalid", media_type="application/json")
+    if created and mode == "http_5xx":
+        return error("temporarily_unavailable", 503)
+    return envelope(row)
 
 
 @app.get("/charges/by-key/{key}", dependencies=[Depends(credential)])
 async def lookup(key: UUID, request: Request):
+    hidden, unavailable = False, False
     async with request.app.state.engine.begin() as c:
         row = (
             (await c.execute(text("SELECT * FROM operations WHERE key=:key"), {"key": key}))
@@ -188,11 +224,27 @@ async def lookup(key: UUID, request: Request):
             text("INSERT INTO calls(key,method_ref,kind) VALUES(:key,:ref,'lookup')"),
             {"key": key, "ref": row["method_ref"] if row else None},
         )
-    return (
-        envelope(row)
-        if row
-        else JSONResponse({"key": str(key), "status": "not_found"}, status_code=404)
-    )
+        if row and request.app.state.settings.app_profile in {"test", "demo"}:
+            ref = {"ref": row["method_ref"]}
+            mode = await c.scalar(
+                text("SELECT lookup_mode FROM fixtures WHERE method_ref=:ref FOR UPDATE"), ref
+            )
+            unavailable = mode == "unavailable"
+            if mode == "temporary_not_found":
+                hidden = bool(
+                    await c.scalar(
+                        text("""UPDATE fixtures
+                    SET lookup_not_found_count=lookup_not_found_count-1
+                    WHERE method_ref=:ref AND lookup_not_found_count>0
+                    RETURNING lookup_not_found_count+1"""),
+                        ref,
+                    )
+                )
+    if unavailable:
+        return error("temporarily_unavailable", 503)
+    if row and not hidden:
+        return envelope(row)
+    return JSONResponse({"key": str(key), "status": "not_found"}, status_code=404)
 
 
 @app.put("/__test/fixtures/{method_ref}", dependencies=[Depends(controls)])
@@ -203,13 +255,70 @@ async def fixture(method_ref: str, body: Fixture, request: Request):
         return error("validation_error", 422, fields=["method_ref"])
     async with request.app.state.engine.begin() as c:
         await c.execute(
-            text("""INSERT INTO fixtures(method_ref,charge_mode,barrier)
-            VALUES(:ref,:mode,:barrier)
+            text("""INSERT INTO fixtures
+            (method_ref,charge_mode,barrier,lookup_mode,lookup_not_found_count)
+            VALUES(:ref,:charge_mode,:barrier,:lookup_mode,:lookup_not_found_count)
             ON CONFLICT(method_ref) DO UPDATE SET charge_mode=excluded.charge_mode,
-            barrier=excluded.barrier"""),
-            {"ref": method_ref, "mode": body.charge_mode, "barrier": body.barrier},
+            barrier=excluded.barrier, lookup_mode=excluded.lookup_mode,
+            lookup_not_found_count=excluded.lookup_not_found_count"""),
+            {"ref": method_ref} | body.model_dump(),
         )
     return body.model_dump()
+
+
+class Resolve(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    status: Literal["succeeded", "declined_retryable", "declined_terminal", "not_charged_final"]
+    error_code: str | None
+
+    @model_validator(mode="after")
+    def final_pair(self):
+        if self.error_code != OPERATION_CODES[self.status]:
+            raise ValueError("invalid final status/error pair")
+        return self
+
+
+@app.post("/__test/operations/{key}/resolve", dependencies=[Depends(controls)])
+async def resolve(key: UUID, body: Resolve, request: Request):
+    async with request.app.state.engine.begin() as c:
+        row = (
+            (
+                await c.execute(
+                    text("SELECT * FROM operations WHERE key=:key FOR UPDATE"), {"key": key}
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            return error("operation_not_found", 404)
+        if row["status"] != "pending":
+            if (row["status"], row["error_code"]) != (body.status, body.error_code):
+                return error("final_operation_conflict", 409)
+            return envelope(row)
+        updated = (
+            (
+                await c.execute(
+                    text("""UPDATE operations SET status=:status,error_code=:error_code
+                WHERE key=:key RETURNING *"""),
+                    {"key": key} | body.model_dump(),
+                )
+            )
+            .mappings()
+            .one()
+        )
+        if body.status == "succeeded":
+            await c.execute(
+                text("""INSERT INTO ledger(id,operation_id,amount_minor,currency)
+                VALUES(:id,:external_id,:amount_minor,:currency)"""),
+                dict(
+                    id=uuid4(),
+                    external_id=row["external_id"],
+                    amount_minor=row["amount_minor"],
+                    currency=row["currency"],
+                ),
+            )
+    return envelope(updated)
 
 
 @app.get("/__test/stats", dependencies=[Depends(controls)])

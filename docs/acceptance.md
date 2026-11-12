@@ -1,6 +1,6 @@
 # Критерии приёмки и будущие проверки
 
-Статус: контракт проверки; D1–D3 реализованы и проверены, D4–D6 пока будущие. Фактические результаты отдельно в [verification.md](verification.md). Указанные test IDs — обязательные будущие имена; менять их можно только вместе с этой матрицей. Нормативные [решения](decisions.md) и [HTTP provider contract](provider-contract.md) самодостаточны.
+Статус: контракт проверки; D1–D5 реализованы; D6 остаётся будущим объёмом. Фактические результаты отдельно в [verification.md](verification.md). Указанные test IDs — обязательные будущие имена; менять их можно только вместе с этой матрицей. Нормативные [решения](decisions.md) и [HTTP provider contract](provider-contract.md) самодостаточны.
 
 ## Метод доказательства
 
@@ -8,7 +8,7 @@ Unit проверяет переходы и часы; integration/e2e испол
 
 ## Шесть демонстраций
 
-D1–D3 доступны по README и фактически запускались. Команды D4–D6 — будущий интерфейс.
+D1–D5 доступны по README; фактические запуски отдельно зафиксированы в verification.md. D6 остаётся будущим интерфейсом.
 
 | ID / сценарий / будущая команда | Контракт и ожидаемый результат | Будущий тест |
 |---|---|---|
@@ -25,11 +25,11 @@ D4/D6 обязаны показывать достигнутую промежу�
 
 | ID / вопрос | Нормативное решение, поле/контракт | Будущая проверка и наблюдение |
 |---|---|---|
-| Q1 Потерян external_id | Provider lookup по key; key=UUID attempt сохраняется до HTTP, external_id nullable | D4; `test_unknown.py::test_lookup_without_external_id`: списание найдено, B=0 |
+| Q1 Потерян external_id | Provider lookup по key; key=UUID attempt сохраняется до HTTP, external_id nullable | D4; `test_unknown.py::test_charge_then_disconnect`: списание найдено, B=0 |
 | Q2 Одновременно worker/recovery | Decisions: lock payment → attempt, lease_until/claim_version, commit до HTTP, условное сохранение ответа | `test_concurrency.py::test_active_lease_noop`, `test_recovery.py::test_stale_owner`: дубли не вызывают HTTP; поздний ответ не меняет состояние |
-| Q3 Когда разрешён каскад | Таблица результатов decisions; provider финальный отказ исключает позднее списание | D2/D3; `test_cascade.py::test_terminal_decline`, `test_unknown.py::test_lookup_final_decline`: B только после retryable/not_charged_final |
-| Q4 Когда допустим повтор | Неизменные payload/key, safe_retry_until=attempt created_at+24ч; provider хранит ключи весь срок данных | `test_unknown.py::test_not_found_same_key`, `tests/unit/test_reconciliation_limits.py::test_safe_retry_boundary`: до окна прежний key; на границе/после — charge=0 |
-| Q5 Как остановить сверку | Persisted check_count/deadline/next_check_at/manual_review_required; неизвестность не failed | `test_unknown.py::test_manual_review`, `test_fault_matrix.py::test_limits_survive_restart`: не более 5 циклов; unknown/manual; Redis/restart не оживляет |
+| Q3 Когда разрешён каскад | Таблица результатов decisions; provider финальный отказ исключает позднее списание | D2/D3; `test_cascade.py::test_terminal_decline`, `test_unknown.py::test_pending_lookup_final`: B только после retryable/not_charged_final |
+| Q4 Когда допустим повтор | Неизменные payload/key, safe_retry_until=attempt created_at+24ч; provider хранит ключи весь срок данных | `test_unknown.py::test_temporary_not_found_same_key`, `tests/unit/test_reconciliation_limits.py::test_safe_retry_boundary`: до окна прежний key; на границе/после — charge=0 |
+| Q5 Как остановить сверку | Persisted check_count/deadline/next_check_at/manual_review_required; неизвестность не failed | `test_unknown.py::test_budget_manual_no_sixth_lookup`, `test_fault_matrix.py::test_limits_survive_restart`: не более 5 циклов; unknown/manual; Redis/restart не оживляет |
 | Q6 Чем доказано списание | Отдельные provider DB, UNIQUE(key), UNIQUE(operation_id), atomic operation/ledger, защищённый HTTP stats | `test_idempotency.py::test_mock_race_and_restart`: конкурентный charge и restart → тот же external_id, ledger=1; D1–D6 |
 
 Пути test_*.py без префикса в этой таблице относятся к `tests/integration/`.
@@ -41,7 +41,7 @@ D4/D6 обязаны показывать достигнутую промежу�
 | ID | Будущий test ID (каталог tests/integration/, если не указано иное) | Требуемый результат |
 |---|---|---|
 | G1 | `test_unknown.py::test_ambiguous_results` (timeout/pending/5xx/malformed/неожиданный 4xx/неизвестный code/неверный envelope) | unknown, никакого B; исчерпание не превращает в failed |
-| G2 | `test_unknown.py::test_temporary_not_found` | Даже если lookup скрывает списание, повтор charge тем же key даёт ledger=1; новый key/attempt не появляется |
+| G2 | `test_unknown.py::test_temporary_not_found_same_key` | Даже если lookup скрывает списание, повтор charge тем же key даёт ledger=1; новый key/attempt не появляется |
 | G3 | `test_idempotency.py::test_payload_conflict` / `test_merchant_scope` | Другие данные под merchant/key →409, включая гонку; другой merchant с тем же key →другой payment |
 | G4 | `test_concurrency.py::test_duplicate_cascade` | Дубли перехода A→B не создают третью attempt, B ledger<=1 |
 | G5 | `test_recovery.py::test_outbox_commit_before_publish` | Сбой после payment/outbox commit, до publish: без нового POST восстановление исходного ID |
@@ -103,8 +103,8 @@ sequence/UUID/key, число outbox, история GET, повтор терм�
 неожиданные HTTP-коды, disconnect и timeout. Это проверка adapter отдельно от
 платёжного e2e; она не объявляется финансовой fault-matrix.
 
-Автоматический lookup/reconciliation не реализован: обычный not_found проверен
-как запрет в policy/adapter, а не как завершённый сценарий автоматической сверки.
+На этом историческом этапе автоматический lookup ещё не был реализован;
+текущие проверки сверки приведены в разделе ниже.
 Детали и ограничения фактических запусков — [verification.md](verification.md).
 
 
@@ -135,5 +135,61 @@ sequence/UUID/key, число outbox, история GET, повтор терм�
 - `scripts/check_first_payment_runtime.py`: canonical success/отказы после restart,
   controls (включая barrier) возвращают 404 в production, логи безопасны.
 
-D5 реализован; D4/D6, автоматическая сверка и DB recovery остаются будущим объёмом.
+D5 реализован; этот исторический результат не включал D4 и сверку. Текущий
+объём сверки указан ниже; D6/DB recovery остаются будущим объёмом.
 Низкоуровневые DB-проверки дополняют финансовые e2e, не подменяют их.
+
+
+## Регрессии предохранителей перед сверкой
+
+- `tests/unit/test_http_provider.py::test_envelope_and_transport`: полный
+  HTTP 200 envelope с not_found/unknown и неканонический external UUID
+  дают unknown без external_id/error_code, дополнительно ко всем прежним вариантам.
+- `tests/unit/test_initial_window.py`: точная граница окна ±1μs, запрет
+  просроченного claim, прежний key/window и сохранение существующей истории.
+- `tests/integration/test_initial_window_db.py`: атомарность/rollback,
+  duplicate no-op, commit unknown/outbox без provider-вызова, время БД после
+  наблюдаемого ожидания payment lock. Это DB/application регрессии, не финансовые
+  e2e сверки.
+- `tests/integration/test_dispatcher_event_types.py`: реальный PostgreSQL с
+  connection-local временным outbox; неподдерживаемый reconcile остаётся
+  unpublished, обычный process публикуется до mark; при ошибке публикации retry
+  сохраняется. Transport boundary подменён; этот тест не заменяет Taskiq e2e.
+
+Эти предохранители отдельно от финансовых сценариев сверки: сами по себе они
+не доказывают D4/lookup/budget. Текущие e2e сверки перечислены далее;
+фактические запуски — в verification.md.
+
+
+## Реализованная сверка unknown
+
+- `test_unknown.py::test_charge_then_disconnect`: D4, observed unknown с null
+  external_id → lookup → succeeded, ledger A=1/B calls=0.
+- `test_ambiguous_results`: malformed/5xx, unknown без B, затем canonical lookup.
+- `test_pending_lookup_final`: pending расходует проверку без charge, resolve
+  success/разрешённые отказы/terminal, правильный каскад и неизменные финалы.
+- `test_temporary_not_found_same_key`: существующий success скрыт ровно один раз,
+  повтор charge тем же key даёт calls2/ledger1, одна attempt, B=0.
+- `test_not_found_without_operation_and_timeout`: timeout до financial commit,
+  обычный404, повтор прежнего key в окне, explicit barrier release, ledger1.
+- `test_budget_manual_no_sixth_lookup`: пять реальных lookup, unknown/manual,
+  дубли Taskiq не делают шестого HTTP и не вызывают B.
+- `test_taskiq_duplicates_respect_persisted_due_and_lease`: настоящий Taskiq при
+  управляемых persisted due/lease собственного тестового payment, без нового HTTP.
+- `test_reconciliation_limits.py` и `test_reconciliation_db.py`: порядок
+  terminal/manual/lease/limits/due, backoff/deadline/window boundaries,
+  пятый действующий owner после deadline, expired/foreign/stale/manual result,
+  проверка времени после lock, общий atomic decline/B/outbox. Это дополнительные
+  unit/DB/application тесты, не замена финансовым e2e.
+- `test_reconciliation_transport.py` и `test_dispatcher_event_types.py`: due,
+  бюджет независимо от due, типы событий, publish-before-mark/failure/retry и
+  bounded batch; временные DB-таблицы и подменённая граница публикации.
+- `test_mock_faults.py`: настоящие HTTP A/B faults, точный конкурентный счётчик,
+  resolve все4 финала, запрет повторного fixture/barrier для existing operation.
+- `check_reconciliation_runtime.py`: ручной marker/count/deadline/window после
+  restart процессов, canonical финалы и ledger обоих mock после restart.
+
+Полные пути test-файлов относятся к tests/integration, кроме unit limits и
+lookup adapter тестов в tests/unit. Результаты запусков и ограничения —
+verification.md. Полная комбинированная fault-matrix/D6/Redis-loss recovery не
+объявляются выполненными этим этапом.

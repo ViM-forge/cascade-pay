@@ -63,6 +63,8 @@ async def server(body, code=200, delay=0, disconnect=False):
         "not_charged_final",
         "pending",
         "not_found",
+        "not_found_envelope",
+        "unknown_envelope",
         "wrong_key",
         "wrong_amount",
         "wrong_currency",
@@ -73,6 +75,7 @@ async def server(body, code=200, delay=0, disconnect=False):
         "bad_status",
         "bad_external",
         "noncanonical_key",
+        "noncanonical_external",
         "malformed",
         "http400",
         "http404",
@@ -107,6 +110,8 @@ async def test_envelope_and_transport(variant):
         expected = status
     elif variant == "not_found":
         body = dict(key=str(a.id), status="not_found")
+    elif variant in {"not_found_envelope", "unknown_envelope"}:
+        body["status"] = variant.removesuffix("_envelope")
     elif variant.startswith("wrong_"):
         field, value = {
             "wrong_key": ("key", str(uuid4())),
@@ -127,6 +132,8 @@ async def test_envelope_and_transport(variant):
         body["external_id"] = None
     elif variant == "noncanonical_key":
         body["key"] = a.id.hex
+    elif variant == "noncanonical_external":
+        body["external_id"] = uuid4().hex
     elif variant == "malformed":
         body = b"not json"
     code = int(variant[4:]) if variant.startswith("http") else 200
@@ -143,6 +150,9 @@ async def test_envelope_and_transport(variant):
         )
         result = await HttpProvider(s).charge(p, a)
         assert result.status == expected
+        if expected == "unknown":
+            assert result.external_id is None
+            assert result.error_code is None
         assert len(calls) == 1
         assert b"Bearer " + b"b" * 32 in calls[0][0]
         assert calls[0][1] == dict(

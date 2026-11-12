@@ -4,7 +4,7 @@ from uuid import UUID
 
 from taskiq import Context, TaskiqDepends, TaskiqEvents
 
-from payments.application.use_cases import process_payment
+from payments.application.use_cases import process_payment, reconcile_payment
 from payments.infrastructure.db import create_engine, session_factory
 from payments.infrastructure.http_provider import HttpProvider
 from payments.infrastructure.logging import configure_logging
@@ -59,4 +59,24 @@ async def process(payment_id: str, context: Context = TaskiqDepends()):  # noqa:
         ),
     )
     # No finally ACK: failures before a committed result/no-op remain pending.
+    await context.ack()
+
+
+@broker.task(task_name="reconcile_payment")
+async def reconcile(payment_id: str, context: Context = TaskiqDepends()):  # noqa: B008
+    started = time.monotonic()
+    result, attempt_id, provider = await reconcile_payment(
+        SqlUoW(context.state.sessions, settings), HttpProvider(settings), UUID(payment_id)
+    )
+    logging.info(
+        "payment reconciled",
+        extra=dict(
+            event="payment_reconciled",
+            payment_id=payment_id,
+            attempt_id=str(attempt_id) if attempt_id else None,
+            provider=provider,
+            duration=time.monotonic() - started,
+            result=result,
+        ),
+    )
     await context.ack()

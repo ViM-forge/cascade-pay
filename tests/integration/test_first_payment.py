@@ -226,14 +226,17 @@ async def test_negative_jwt_and_validation_http():
             assert r.status_code == 422
 
 
-async def test_exception_before_commit_is_not_acked():
-    from payments.infrastructure.worker import broker, process
+@pytest.mark.parametrize("task_kind", ["process", "reconcile"])
+async def test_exception_before_commit_is_not_acked(task_kind):
+    from payments.infrastructure.worker import broker, process, reconcile
 
     s = load_settings()
     redis = Redis.from_url(s.redis_url.get_secret_value())
     await broker.startup()
     try:
-        task = await process.kiq("invalid-uuid-for-ack-test")
+        task = await (process if task_kind == "process" else reconcile).kiq(
+            "invalid-uuid-for-ack-test"
+        )
         async with asyncio.timeout(8):
             while True:
                 entries = await redis.xrange("payments")

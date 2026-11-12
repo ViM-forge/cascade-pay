@@ -1,6 +1,6 @@
 # HTTP-контракт mock-провайдеров A и B
 
-Статус: нормативная спецификация. Реализованы success/lookup, долговечная идемпотентность, fixtures success/declined_retryable/declined_terminal/not_charged_final и stats. Реализованы два barrier, описанные ниже. Остальные fixture modes и resolve ещё не реализованы; это будущий объём. Фактические проверки — в [verification.md](verification.md). Локальные переходы описаны в [decisions.md](decisions.md), проверки — в [acceptance.md](acceptance.md).
+Статус: нормативная спецификация. Реализованы success/lookup, долговечная идемпотентность, fixtures success/declined_retryable/declined_terminal/not_charged_final и stats. Реализованы два barrier, описанные ниже. Все перечисленные ниже fixture modes и защищённый resolve реализованы. Фактические проверки — в [verification.md](verification.md). Локальные переходы описаны в [decisions.md](decisions.md), проверки — в [acceptance.md](acceptance.md).
 
 ## Изоляция и долговечность
 
@@ -20,7 +20,7 @@ Namespace ключа — конкретный provider; ключ — UUID поп
 
 Key — UUID; amount_minor и method_ref имеют те же пределы и строгие типы, что публичные amount_minor/payment_method_ref из [входного контракта](decisions.md#публичный-api-и-идемпотентность). Currency здесь уже строго `USD`. Лишние поля, null, невалидные типы — 422 `{"error":{"code":"validation_error","fields":["<имя поля>"]}}`, без списания и без эха значений. Вход key не является частью финансового payload. Provider хранит проверенный payload (amount_minor,currency,method_ref) и SHA-256 canonical JSON по правилам decisions; сравнивает и поля.
 
-В одной транзакции provider: учитывает вызов, получает/создаёт operation с UNIQUE(key), сохраняет payload, выбирает результат fixture, при success создаёт ledger с UNIQUE(operation_id), затем commit. Проигравший `INSERT ON CONFLICT(key) DO NOTHING` не вызывает UNIQUE-исключение; отдельный SELECT при READ COMMITTED читает победителя. Проверяются hash и поля. При действительной SQL-ошибке требуется rollback/savepoint, чтение из aborted transaction запрещено ([PostgreSQL 17](https://www.postgresql.org/docs/17/transaction-iso.html#XACT-READ-COMMITTED)). Если payload равен — каноническая операция; если иной — 409 `{"error":{"code":"idempotency_conflict"}}`, существующая операция не меняется и дополнительного списания нет. Конфликт не является разрешённым отказом текущего платежа: адаптер переводит его в unknown и сигнализирует проблему.
+Сначала provider учитывает аутентифицированный валидный HTTP-вызов отдельным commit, до barrier/fault. Затем в финансовой транзакции получает/создаёт operation с UNIQUE(key), сохраняет payload, выбирает результат fixture, при success создаёт ledger с UNIQUE(operation_id), затем commit. Проигравший `INSERT ON CONFLICT(key) DO NOTHING` не вызывает UNIQUE-исключение; отдельный SELECT при READ COMMITTED читает победителя. Проверяются hash и поля. При действительной SQL-ошибке требуется rollback/savepoint, чтение из aborted transaction запрещено ([PostgreSQL 17](https://www.postgresql.org/docs/17/transaction-iso.html#XACT-READ-COMMITTED)). Если payload равен — каноническая операция; если иной — 409 `{"error":{"code":"idempotency_conflict"}}`, существующая операция не меняется и дополнительного списания нет. Конфликт не является разрешённым отказом текущего платежа: адаптер переводит его в unknown и сигнализирует проблему.
 
 Любой корректный результат (новый или повтор) — HTTP 200, в том числе бизнес-отказ. Порядок JSON-полей незначим. Ответ содержит ровно `key, external_id, amount_minor, currency, method_ref, status, error_code`:
 
@@ -56,7 +56,7 @@ Not_charged_final доступен только как сохранённая т
 
 Success/declines/tombstone фиксируются в provider DB; pending создаёт pending. Charge_then_disconnect коммитит success + ledger и обрывает TCP/HTTP без полноценного ответа (если нужно — test-only TCP proxy). Malformed_response коммитит success, затем возвращает 200 с невалидным JSON; http_5xx коммитит success, затем отдаёт 503. Timeout_before_result удерживает запрос за barrier до истечения клиентских 2 с, затем обычный success с дедупликацией: тест не должен предполагать отсутствие списания из-за таймаута. Pending можно завершить через `POST /__test/operations/{key}/resolve` с `{"status":"succeeded","error_code":null}` либо одной из согласованных финальных пар; 200 с envelope, конфликт с иным уже финальным исходом — 409. Success и ledger фиксируются атомарно.
 
-`barrier` = null либо `before_charge_commit`/`after_charge_commit_before_response`; состояние barrier наблюдается `GET /__test/barriers/{key}` → 200 `{"key":"<UUID>","point":"<имя>","reached":true,"released":false}` (до достижения reached=false). `POST /__test/barriers/{key}/release` с пустым объектом — 200 с released=true; повтор безопасен. Реализованный before_charge_commit останавливает обработчик **до начала атомарной транзакции charge**; after_charge_commit_before_response — после её commit. Оба не удерживают транзакцию/row lock во время ожидания. Состояние достигнутой точки хранится в собственной БД mock (миграция mock_0003); до достижения point=null/reached=false. Release для достигнутой точки идемпотентен; для ещё не достигнутого ключа состояние остаётся reached=false/released=false. Демо и тесты ждут reached=true, освобождают в finally; ожидание сервером ограничено 30 с. Polling опирается на наблюдаемое состояние, интервалы не определяют момент освобождения. Barrier для одного key после release не взводится заново. В production сохранённая fixture с barrier также игнорируется. Это синхронизация проверки конкуренции, дополнительные fault modes не реализованы. Для границ worker/outbox/result commit применяются отдельные локальные failpoints процесса; в payment HTTP API они не выставляются.
+`barrier` = null либо `before_charge_commit`/`after_charge_commit_before_response`; состояние barrier наблюдается `GET /__test/barriers/{key}` → 200 `{"key":"<UUID>","point":"<имя>","reached":true,"released":false}` (до достижения reached=false). `POST /__test/barriers/{key}/release` с пустым объектом — 200 с released=true; повтор безопасен. Реализованный before_charge_commit останавливает обработчик **до начала атомарной транзакции charge**; after_charge_commit_before_response — после её commit. Оба не удерживают транзакцию/row lock во время ожидания. Состояние достигнутой точки хранится в собственной БД mock (миграции mock_0003/mock_0004); до достижения point=null/reached=false. Release для достигнутой точки идемпотентен; для ещё не достигнутого ключа состояние остаётся reached=false/released=false. Демо и тесты ждут reached=true, освобождают в finally; ожидание сервером ограничено 30 с. Polling опирается на наблюдаемое состояние, интервалы не определяют момент освобождения. Barrier для одного key после release не взводится заново. В production сохранённая fixture с barrier также игнорируется. Это синхронизация проверки; timeout_before_result автоматически использует before_charge_commit. Для границ worker/outbox/result commit применяются отдельные локальные failpoints процесса; в payment HTTP API они не выставляются.
 
 `GET /__test/stats?key=<UUID>` или `?method_ref=<urlencoded ref>` — ровно один фильтр, иначе 422. Ответ 200:
 
@@ -69,3 +69,20 @@ Success/declines/tombstone фиксируются в provider DB; pending соз
 ## Обязательства для реального адаптера
 
 Наличие локального lease не заменяет provider идемпотентность. Без долговечного ключа, lookup без external_id и финального отказа, исключающего позднее списание, гарантию отсутствия повторного списания и безопасный каскад обещать нельзя. Реальные платёжные ref между провайдерами автоматически не переносятся.
+
+
+## Реальный disconnect и повтор финала
+
+Launcher `python -m mock_provider.server` в test/demo использует TCP proxy на
+публичном mock-порту и loopback backend. После commit charge_then_disconnect
+backend посылает внутренний marker; proxy закрывает клиентский socket без
+HTTP-ответа. В production proxy выключен, новые операции игнорируют fixtures.
+
+После учёта HTTP-вызова существующая операция проверяется до fixture/barrier:
+равный payload сразу возвращает canonical, другой — 409. Поэтому смена fixture
+на timeout/barrier не останавливает повтор финала/pending. Для новых конкурентных
+операций сохраняются INSERT ON CONFLICT и отдельный SELECT победителя.
+Lookup temporary_not_found уменьшает сохранённый счётчик под row lock fixture;
+ровно указанное число lookup скрывает запись, включая конкурентные вызовы.
+Lookup faults определяются по method_ref существующей операции; полностью
+отсутствующий key возвращает обычный 404. Это не создаёт tombstone.

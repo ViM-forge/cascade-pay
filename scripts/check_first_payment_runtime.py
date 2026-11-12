@@ -1,4 +1,4 @@
-"""Host-only checks: restart mock A, unknown on unavailable A, safe logs and controls.
+"""Host-only checks: restart mock A, unknown resolved by reconciliation, safe controls.
 
 Stops only this Compose project's mock-a; never removes volumes.
 """
@@ -80,17 +80,39 @@ def main():
             assert b.json()["create_calls"] == 0
         finally:
             compose("up", "-d", "--wait", "mock-a")
-        absent = c.get(
-            s.provider_a_url + "/charges/by-key/" + unknown["attempts"][0]["id"], headers=pa
+        # The same unknown payment now reconciles: lookup not_found permits only
+        # charge of its saved attempt/key, never a new payment or provider B.
+        resolved = poll(unknown_id, "succeeded")
+        assert resolved["id"] == unknown_id and len(resolved["attempts"]) == 1
+        resolved_attempt = resolved["attempts"][0]
+        unknown_key = unknown["attempts"][0]["id"]
+        assert resolved_attempt["id"] == unknown_key
+        assert resolved_attempt["provider"] == "A"
+        assert resolved_attempt["status"] == "succeeded" and resolved_attempt["external_id"]
+        canonical_resolved = c.get(s.provider_a_url + "/charges/by-key/" + unknown_key, headers=pa)
+        assert canonical_resolved.status_code == 200
+        assert canonical_resolved.json() == dict(
+            key=unknown_key,
+            external_id=resolved_attempt["external_id"],
+            amount_minor=789,
+            currency="USD",
+            method_ref=unknown_ref,
+            status="succeeded",
+            error_code=None,
         )
-        assert absent.status_code == 404 and absent.json()["status"] == "not_found"
-        assert c.get(base + "/payments/" + unknown_id, headers=auth).json()["status"] == "unknown"
-        assert (
-            c.get(
-                s.provider_b_url + "/__test/stats", headers=pb, params={"method_ref": unknown_ref}
-            ).json()["create_calls"]
-            == 0
+        recovered_stats = c.get(
+            s.provider_a_url + "/__test/stats", headers=pa, params={"key": unknown_key}
         )
+        assert recovered_stats.status_code == 200
+        recovered_stats = recovered_stats.json()
+        assert recovered_stats["operation_count"] == recovered_stats["ledger_count"] == 1
+        assert recovered_stats["ledger_amount_minor"] == 789
+        assert recovered_stats["create_calls"] == 1
+        b = c.get(
+            s.provider_b_url + "/__test/stats", headers=pb, params={"method_ref": unknown_ref}
+        )
+        assert b.status_code == 200
+        assert b.json()["create_calls"] == b.json()["ledger_count"] == 0
         for body, canonical in refusals:
             lookup = c.get(s.provider_a_url + "/charges/by-key/" + body["key"], headers=pa)
             assert lookup.json() == canonical
@@ -150,12 +172,15 @@ def main():
                 ("PUT", "/__test/fixtures/demo"),
                 ("GET", "/__test/barriers/" + str(uuid4())),
                 ("POST", "/__test/barriers/" + str(uuid4()) + "/release"),
+                ("POST", "/__test/operations/" + str(uuid4()) + "/resolve"),
             ]:
                 r = c.request(
                     verb,
                     "http://127.0.0.1:18001" + path,
                     headers=pa,
-                    json={"charge_mode": "success"}
+                    json={"status": "succeeded", "error_code": None}
+                    if path.endswith("/resolve")
+                    else {"charge_mode": "success"}
                     if verb == "PUT"
                     else {}
                     if verb == "POST"
@@ -175,20 +200,23 @@ def main():
         s.jwt_secret.get_secret_value(),
         s.mock_a_service_credential.get_secret_value(),
         s.mock_b_service_credential.get_secret_value(),
-        issue(s),
+        auth["Authorization"].removeprefix("Bearer "),
         *refs,
     ]:
         assert value not in logs, "sensitive value found in logs"
     assert "Authorization" not in logs
-    assert "payment_processed" in logs and "attempt_id" in logs
+    assert "payment_processed" in logs and "payment_reconciled" in logs and "attempt_id" in logs
     print(
         json.dumps(
             dict(
                 restart_lookup="passed",
                 durable_declines_after_restart="passed",
-                ordinary_not_found_without_B="passed",
+                same_unknown_resolved_without_B="passed",
+                recovered_attempt_key_preserved="passed",
+                recovered_ledger_count=1,
+                recovered_ledger_amount_minor=789,
                 ledger_count=1,
-                unknown_without_B="passed",
+                unknown_observed_while_a_stopped="passed",
                 production_controls="404",
                 safe_logs="passed",
             )
