@@ -1,6 +1,22 @@
 # Контракты и решения MVP
 
-Статус: контракты приняты; окружение, health и базовая миграция реализованы и проверены — [проверки окружения](verification.md). Success через A и последовательный каскад после подтверждённых разрешённых отказов реализованы; проверки и ограничения — в verification.md. Ограниченная сверка unknown реализована; общий DB recovery реализован; фактические проверки — в verification.md. Нормативный контракт провайдеров: [provider-contract.md](provider-contract.md), матрица исполняемых проверок: [acceptance.md](acceptance.md).
+Этот документ объясняет принятые решения и задаёт точные правила реализации.
+Для запуска достаточно [README](../README.md); HTTP-ответы mock описаны отдельно
+в [контракте провайдеров](provider-contract.md).
+
+Порядок чтения: архитектура → API → хранение → правила каскада → восстановление.
+Последние разделы содержат детали реализации для ревью и сопровождения.
+Фактические результаты запусков находятся в [отчёте проверок](verification.md).
+
+| Термин | Значение в проекте |
+|---|---|
+| Payment | Намерение merchant списать конкретную сумму |
+| Attempt | Одна операция у одного провайдера с неизменным ключом |
+| Outbox | Запись в PostgreSQL о необходимости поставить фоновую задачу |
+| Lease / claim version | Срок права обработки и версия владельца для защиты от позднего ответа |
+| Lookup / reconciliation | Запрос статуса у провайдера / процесс выяснения неизвестного результата |
+| Ledger | Независимый журнал фактических списаний провайдера |
+| Manual review | Автоматика остановлена; исход нужно выяснять вручную |
 
 ## Объём и архитектура
 
@@ -28,6 +44,8 @@ Domain entities — отдельные Pydantic v2 BaseModel, `frozen=True`, `ex
 
 ## Публичный API и идемпотентность
 
+### Создание платежа и повтор запроса
+
 `POST /payments`, `Content-Type: application/json`, `Authorization: Bearer …`, один обязательный `Idempotency-Key` — непустая строка до 128 символов. Ключ — видимые ASCII-символы 0x21..0x7E (без пробелов/управляющих), регистр значим; не обрезать и не менять. Scope: `(merchant_id, idempotency_key)`, хранение весь срок данных платежа. Отсутствующий/пустой/слишком длинный или дублированный header — 422. Merchant не принимается в теле.
 
 Тело содержит ровно `amount_minor`, `currency`, `payment_method_ref`. Currency — строгая строка из трёх ASCII-букв, приводится к верхнему регистру; принимается только USD (например, usd → USD), пробелы не удаляются. Лишние поля и null запрещены. Amount_minor — строго JSON integer, 1..9223372036854775807; bool, float (включая 1.0/1e0) и числовые строки запрещены. Хранение — BIGINT с CHECK >0, без преобразования через float; верхняя граница соответствует [PostgreSQL BIGINT](https://www.postgresql.org/docs/current/datatype-numeric.html). Payment_method_ref — строгая Unicode-строка 1..255 кодовых точек, без Unicode whitespace (str.isspace), управляющих Cc, форматирующих Cf и surrogate Cs; без trim, casefold или Unicode-нормализации. Остальные символы сохраняются буквально. Пустой/длинный ref, неподходящий тип или лишнее поле →422 до записи БД. Это технический предел MVP, не финансовый бизнес-лимит.
@@ -37,11 +55,17 @@ Canonical JSON строится только из трёх проверенны�
 В одной транзакции создаются payment(pending) и outbox; после commit — 202 `{"id":"<UUID>","status":"pending"}` и `Location: /payments/<UUID>`. Повтор равных данных всегда 202 с тем же id и текущим status, включая terminal. Другие данные — 409 `{"error":{"code":"idempotency_conflict"}}`. Конкурентная вставка использует `INSERT ON CONFLICT DO NOTHING RETURNING`, затем отдельный SELECT победителя при READ COMMITTED. Уникальный конфликт в этом SQL не является исключением и не переводит транзакцию в aborted state; следующий statement получает новый snapshot. Сравниваются hash **и** нормализованные поля. Для настоящей ошибки INSERT требуется rollback/savepoint; продолжать чтение из aborted transaction нельзя.
 Семантика подтверждена [PostgreSQL 17: isolation](https://www.postgresql.org/docs/17/transaction-iso.html#XACT-READ-COMMITTED), [INSERT](https://www.postgresql.org/docs/17/sql-insert.html#SQL-ON-CONFLICT) и [SQLAlchemy 2.0](https://docs.sqlalchemy.org/en/20/dialects/postgresql.html#insert-on-conflict-upsert). В проекте SQLAlchemy 2.0.57/asyncpg 0.32.0, фактический уровень изоляции проверяет integration-тест. Изменение уровня изоляции требует пересмотра протокола. Удаления платежей/ключей и TTL в MVP нет. Недоступность Redis после commit не отменяет платёж. Недоступность БД — 503, клиент повторяет исходный key; потеря ответа на commit не доказывает отсутствие платежа.
 
+### Чтение платежа
+
 `GET /payments/{id}` — 200 с `id, status, amount_minor, currency, created_at, updated_at, manual_review_required, attempts`. UUID и время передаются строками, время UTC RFC3339. Attempts упорядочены по sequence и содержат только `id, sequence, provider, status, external_id|null, error_code|null, check_count, manual_review_required, created_at, updated_at`. Marker платежа вычисляется как наличие manual marker хотя бы у одной из сохранённых попыток. Не выдавать method_ref, provider key, request_hash, lease/version, credentials или сырой ответ провайдера. Неизвестный/чужой UUID — одинаковый 404 `{"error":{"code":"payment_not_found"}}`; некорректный UUID — 422. Прочие validation errors имеют код `validation_error` и безопасный список имён полей, без исходных значений.
+
+### Авторизация и безопасные ответы
 
 JWT: PyJWT, разрешён только HS256, algorithms задаётся сервером. Обязательны sub/exp/iat/iss/aud; issuer=payments-demo, audience=payments-api, sub — UUID одного из двух merchant из конфигурации. Проверяются подпись, issuer/audience, exp, iat (не в будущем), exp>iat и TTL не более 900 с; leeway=0. exp/iat — целые NumericDate без bool. Поддержка обязательных claims и проверки сроков описана в [PyJWT](https://pyjwt.readthedocs.io/en/stable/usage.html). Отсутствующий/невалидный токен — 401 с `WWW-Authenticate: Bearer` и кодом `unauthorized`. Старый API key не поддерживается. Локальный CLI выдаёт demo-токены с TTL 15 минут; публичного login, refresh, revocation, ротации и IdP нет. Секрет — минимум 32 случайных байта через env; рабочие секреты и JWT не коммитятся и не логируются.
 
 Логи — структурированные payment_id/attempt_id/provider/duration/result; без Authorization/JWT, signing secret, service credential, method_ref и сырых тел.
+
+### Проверка доступности
 
 Health: `GET /health/live` — 200 `{"status":"ok"}` при живом процессе. Ready проверяет PostgreSQL и Redis: 200 ok / 503 `{"status":"unavailable"}`, без деталей подключения; доступность mock для ready API не требуется.
 

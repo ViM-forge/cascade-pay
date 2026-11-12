@@ -8,25 +8,15 @@
 
 ## Воспроизводимый запуск и уровни доказательств
 
-```sh
-RUN_INTEGRATION=1 poetry run pytest -q
-poetry run ruff check .
-poetry run ruff format --check .
-# Далее строго последовательно, отдельно от pytest:
-poetry run python scripts/check_idempotency_runtime.py
-poetry run python scripts/check_first_payment_runtime.py
-poetry run python scripts/check_reconciliation_runtime.py
-poetry run python scripts/check_recovery_runtime.py
-```
+Для полного pytest используйте [команду из README](../README.md#проверки).
+Нужны запущенные PostgreSQL, Redis, API, worker, dispatcher и mock A/B с
+применёнными миграциями. Для host-only runtime нужны также локальные зависимости,
+правильный API_URL и demo/test-профиль mock.
 
-Предварительно выполните настройку из README: настоящий Compose PostgreSQL/Redis,
-миграции, API, worker, dispatcher, mock A/B с APP_PROFILE=demo/test; на хосте
-доступны `.env`, зависимости и порты. API_URL по умолчанию для runtime —
-http://127.0.0.1:18000. Для API на порту 8000 перед запуском задайте
-`export API_URL=http://127.0.0.1:8000` (для pytest это также устраняет зависимость
-от его собственного значения по умолчанию). Команды не удаляют PostgreSQL volumes. Runtime управляет
-процессами и восстанавливает сервисы в finally; запускайте только на demo-окружении.
-Recovery runtime намеренно очищает и пересоздаёт Redis этого Compose проекта.
+[Аварийные проверки и runtime-скрипты](operations.md#аварийные-проверки-d6)
+запускаются последовательно, отдельно от pytest. Они управляют процессами;
+recovery runtime очищает Redis demo-проекта. Их успешный запуск не следует
+из одного запуска pytest.
 
 Unit проверяет точные часы/правила без I/O. DB проверяет SQL, ограничения,
 блокировки и fencing, а не факт списания. Transport проверяет доставку/ACK/reclaim.
