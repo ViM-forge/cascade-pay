@@ -336,3 +336,21 @@ before_result_commit, after_result_commit, before_publish, after_publish.
 
 Гарантия требует сохранённых PostgreSQL-данных и контракта устойчивого key/lookup
 провайдера. Потеря PostgreSQL volume, реальные деньги и нагрузочный SLA не покрыты.
+
+## Совместная проверка границ сбоев
+
+[Acceptance-матрица](docs/acceptance.md) связывает D1–D6, Q1–Q6 и G1–G22 с
+существующими test IDs и именованными runtime cases. Финансовый combined case
+в D6 объединяет 10 конкурентных POST, три дубля Taskiq при удержанном HTTP,
+SIGKILL и восстановление старого payment/attempt/key/window из PostgreSQL.
+Перед дублями исходная группа приостанавливается SIGSTOP, чтобы её reader
+не забрал их во внутреннюю очередь. Поздний результат проверяется через
+checkpoint после попытки сохранения и ACK исходного stream entry.
+
+Дополнительно D6 проверяет финал пятого действующего владельца после deadline,
+но до expiry lease. Для двух граничных сценариев пятого claim SQL-fixture задаёт
+count4; это не четыре выполненных HTTP lookup. В success-сценарии настоящий
+lookup один и ledger=1, в crash-before-HTTP lookup=0. Пять реальных lookup и
+отсутствие шестого отдельно проверяют pytest и reconciliation runtime.
+Запускайте runtime последовательно, отдельно от pytest; команды и результаты
+приведены в [verification](docs/verification.md).

@@ -30,6 +30,20 @@ async def acknowledged(redis, task):
             await asyncio.sleep(0.01)
 
 
+async def first_acknowledged(redis, tasks):
+    """Observe a duplicate handled by a free consumer; cancel only local watchers."""
+    watchers = [asyncio.create_task(acknowledged(redis, t)) for t in tasks]
+    try:
+        done, _ = await asyncio.wait(watchers, return_when=asyncio.FIRST_COMPLETED)
+        entry = next(iter(done)).result()
+    finally:
+        for watcher in watchers:
+            if not watcher.done():
+                watcher.cancel()
+        await asyncio.gather(*watchers, return_exceptions=True)
+    return entry
+
+
 async def run_duplicate():
     from payments.infrastructure.worker import broker, process
 
@@ -78,15 +92,7 @@ async def run_duplicate():
                             break
                     await asyncio.sleep(0.01)
                 tasks = [await process.kiq(identity) for _ in range(3)]
-                watchers = [asyncio.create_task(acknowledged(redis, t)) for t in tasks]
-                try:
-                    done, _ = await asyncio.wait(watchers, return_when=asyncio.FIRST_COMPLETED)
-                    entry = next(iter(done)).result()
-                finally:
-                    for watcher in watchers:
-                        if not watcher.done():
-                            watcher.cancel()
-                    await asyncio.gather(*watchers, return_exceptions=True)
+                entry = await first_acknowledged(redis, tasks)
                 # ACK must happen while the original HTTP is still held, not after terminal.
                 state = (
                     await c.get(s.provider_a_url + "/__test/barriers/" + attempt, headers=pa)

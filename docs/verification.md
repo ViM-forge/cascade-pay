@@ -502,3 +502,136 @@ API_URL=http://127.0.0.1:18000 poetry run python scripts/demo.py <scenario>.
 Все шесть основных демо подтверждены, включая D6 выше. Технические и локальные
 журналы обновлены. Новых нерешённых known issues не обнаружено. Проверки не
 подменяют будущий clean checkout и остальные проверки финальной передачи.
+
+## Шаг 8: совместные границы сбоев (2026-11-12)
+
+Проверяется рабочее дерево поверх пользовательского HEAD `f3e0984`
+(`feat: добавить восстановление обработки платежей из PostgreSQL`). Исходный
+`git diff` пуст; новые изменения шага незакоммичены, Git-коммит агент не создавал.
+Матрица D1–D6/Q1–Q6/G1–G22 с конкретными test IDs:
+[acceptance.md](acceptance.md). Результаты предыдущего шага выше — исторические;
+ниже только самостоятельные запуски текущего этапа.
+
+Окружение: macOS, Python 3.13.13, pytest 8.4.2, Ruff 0.14.14,
+SQLAlchemy 2.0.57, asyncpg 0.32.0, httpx 0.28.1, Taskiq 0.13.0,
+taskiq-redis 1.2.4, redis-py 8.1.0; Compose PostgreSQL 17.6 / Redis 7.4.6,
+API на 127.0.0.1:18000, два независимых mock HTTP/БД. Секреты берутся из `.env`.
+Версии не обновлялись.
+
+### Промежуточные проверки и ошибки
+
+- Исходный `RUN_INTEGRATION=1 .venv/bin/pytest -q`: **276 passed**, 87.18с,
+  без skipped. Это самостоятельная проверка исходного состояния.
+- Focused новый DB fencing и domain: **25 passed**, 0.34с (до добавления
+  дополнительного fifth-expired DB кейса). Не итоговый полный набор.
+- Ruff сначала нашёл длинную строку в новом DB-тесте; formatter исправил,
+  повтор lint успешен.
+- Первый расширенный runtime: 8 завершённых cases, затем AssertionError нового
+  combined. Старт второго consumer/ожидание ACK заняли исходный HTTP timeout;
+  snapshot уже изменился в unknown. Cleanup восстановил healthy-сервисы.
+- Второй runtime: 8 cases, затем AssertionError: готовность consumer сама по
+  себе не запрещает сохранение timeout во время ожидания дубликатов.
+- Третий runtime: 8 cases, затем timeout ожидания ACK. Пока worker удержан,
+  его reader может заранее получить дубли и оставить их во внутренней очереди.
+  Это ошибка построения нового сценария, не дефект финансовой обработки.
+- Контроллер теперь использует before_result_commit barrier также для timeout,
+  SIGSTOP исходной группы перед публикацией дублей (останавливается и reader),
+  затем SIGKILL и restart. Ожидание первого ACK вынесено из D5 в общий helper;
+  ожидание старого ответа после release — по ACK, без фиксированного sleep.
+  Во всех неуспешных прогонах PostgreSQL volume сохранён, сервисы восстановлены.
+- При чтении mock Resolve DTO до исполнения success5 исправлено обязательное
+  поле `error_code: null`; падения на этом запросе не было.
+
+Итоговый последовательный прогон выполняется; результаты будут приведены ниже.
+
+Четвёртый runtime: 8 cases, затем AssertionError **после scan** combined:
+контроллер требовал полностью неизменный snapshot, хотя lease к тому времени
+законно истёк и recovery уже перевёл attempt в unknown. Убран лишний readiness
+цикл до HTTP; SIGSTOP исключает prefetch исходным reader. После scan проверяются
+неизменные id/key/window/count, а смена статуса/version при expiry разрешена.
+Отдельные существующие live-lease проверки по-прежнему требуют полного no-op.
+Пятый последовательный прогон запущен. Для позднего ответа дополнительно ожидается
+checkpoint after_result_commit, а не просто пауза после release.
+
+### Финальная аварийная матрица и runtime
+
+Пятый полный аварийный прогон: **11 cases, exit 0**. Команда:
+`API_URL=http://127.0.0.1:18000 .venv/bin/python scripts/check_recovery_runtime.py`.
+Ниже payment / исходный attempt (= provider key для успешных cases), ledger A/B:
+
+| Case | Payment | Attempt / provider key | Ledger |
+|---|---|---|---|
+| commit_before_publish | ec6ebc4e-0a6c-44f7-b801-82088dc9f4e7 | b1d87267-a4f2-46ba-bad9-d7da54085d44 | [1, 0] |
+| publish_before_mark | 729cb99b-fdaa-4f10-aa6e-7aeb3ce17913 | 6ab9e554-92d8-4284-abc9-2cbaf892426b | [1, 0] |
+| published_redis_loss | 6c275c15-a166-4d2d-83e2-6c929e0f80ff | 14742c3e-5da2-4041-a2d3-38c36548a101 | [1, 0] |
+| claim_before_http | b3a8f1db-a4f0-4064-ae9a-fe0d63dc20ed | 90322a3d-eecf-474a-af07-c55248bab378 | [1, 0] |
+| claim_before_ack_reclaim | d31b635d-becb-4d09-bc68-75fe5b31c6c1 | 6ead1ffa-e1e1-4ebd-aa4c-5d3fb28370c7 | [1, 0] |
+| charge_before_result | 5766bc3e-3206-4b58-9aa5-c6c807f7fa17 | 4f835fe8-9668-4459-acd7-c10ebc3c01b9 | [1, 0] |
+| late_owner | 6b0abea5-2399-4f66-bfd9-321d95c8c2fb | 1d540b24-f2e7-4f60-8970-3c50e28e5efa | [1, 0] |
+| commit_before_ack_reclaim | 91f44077-ebcc-4017-8e48-24a2b56071d4 | 5c4da98b-cd5b-46f2-8920-1060631ce9eb | [1, 0] |
+| combined_failures | 37f54043-1a25-465b-81b6-18dc4fe917b7 | 23d10c9e-cd55-41f9-b885-d37da1c454cf | [1, 0] |
+| fifth_owner_success_after_deadline | bd75d330-b484-479e-8176-0a8e5b98c4d8 | 5cae2c6d-edbb-4a0d-a219-066cc407fd54 | [1, 0] |
+| fifth_claim_manual_restart | 6070e315-2744-4c1c-8ffd-956a90f614e0 | 59f25c30-b4aa-435b-8e5c-49ff23db32e9 | [0, 0] |
+
+В `combined_failures`: 10 конкурентных клиентских POST, три реальных Taskiq
+дубля, наблюдение ACK при удерживаемом результате, SIGSTOP/SIGKILL исходной
+группы, restart с сохранёнными данными, canonical lookup. Проверены одна attempt,
+исходные payment/attempt/key/safe_retry_until, ledger amount=123, совпадение
+external_id с независимой operation, B create/lookup=0; create A=1, lookup A=1,
+check_count=1. Прежний safe_retry_until: `2026-11-13T12:06:54.957071+00:00`.
+
+В `fifth_owner_success_after_deadline` count4 и прошедший deadline — SQL fixtures.
+Пятый claim настоящий, provider pending разрешён один раз в success через HTTP,
+пятый live owner получает один настоящий lookup и сохраняет финал после deadline
+до expiry. Ledger1, check_count5, window/deadline сохранены. Это не пять HTTP.
+В `fifth_claim_manual_restart` count4 тоже fixture, lookup=0; настоящий claim5
+commit, SIGKILL до HTTP, expiry/manual, marker/count/deadline/window переживают
+Redis/process/mock restart. Пять настоящих lookup отдельно проверены ниже.
+
+Последовательно после D6 успешно завершились (exit0):
+
+- `.venv/bin/python scripts/check_idempotency_runtime.py`: queued3 до HTTP,
+  разные worker PID, конкурентный дубль B; create1/1, ledger0/1.
+- `.venv/bin/python scripts/check_first_payment_runtime.py`: canonical finals
+  после restart, recovery старой attempt/key, ledger1, production controls404,
+  безопасные логи.
+- `.venv/bin/python scripts/check_reconciliation_runtime.py`: пять реальных
+  lookup + create1, manual после restart и дублей без нового HTTP, ledger0/0,
+  восемь immutable операций обоих mock после restart.
+- `.venv/bin/python scripts/demo.py <scenario>` для first-success,
+  cascade-success, all-declined, lost-response, duplicate-delivery: D1–D5 exit0.
+
+Runtime не запускались одновременно с pytest или друг с другом. PostgreSQL
+volume не удалялся. Рабочие Compose сервисы восстановлены также после неуспехов.
+
+### Итоговый локальный набор
+
+После всех изменений кода, последовательно после runtime/демо:
+
+```sh
+RUN_INTEGRATION=1 API_URL=http://127.0.0.1:18000 .venv/bin/pytest -q
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+docker compose build
+```
+
+**286 passed за 88.42с, без skipped**; Ruff lint и format exit0,
+67 файлов отформатированы; Compose build exit0. Новые 10 проверок:
+7 доменных вариантов запрета позднего результата после success,
+2 DB canonical success/terminal-decline после fencing,
+1 DB expired пятый owner с прежней version до recovery и последующим manual.
+Production-код и зависимости не менялись.
+
+### Итоговый Docker и состояние передачи
+
+`docker compose run --rm -e RUN_INTEGRATION=1 -e API_URL=http://api:8000 api pytest -q`:
+**286 passed in 88.61s (0:01:28)**, без skipped, exit0. Проверены окончательные изменения, включая
+общий ACK helper в CLI D5 и комбинированной матрице. `git diff --check` успешен;
+указанные test IDs и локальные ссылки текущих журналов существуют.
+
+Все критерии этого этапа выполнены. Новых known issues не обнаружено. Изменения
+остаются незакоммиченными поверх f3e0984; коммиты создаёт пользователь.
+Ограничения: гарантии mock при сохранности PostgreSQL, host-only Unix runtime;
+SQL fixtures count4/deadline не являются HTTP-вызовами. Нагрузка/SLA, реальные
+деньги, потеря PostgreSQL volume, Windows runtime и финальный clean checkout
+не проверялись. Exactly-once транспорта не заявляется.

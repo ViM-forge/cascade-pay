@@ -117,3 +117,41 @@ def test_canonical_hash_unicode_and_boundaries():
         == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     )
     assert request_hash(1, "USD", "é") != request_hash(1, "USD", "e\u0301")
+
+
+@pytest.mark.parametrize(
+    "status,code",
+    [
+        ("succeeded", None),
+        ("declined_retryable", "issuer_unavailable"),
+        ("declined_terminal", "invalid_payment_method"),
+        ("not_charged_final", "not_charged_final"),
+        ("pending", None),
+        ("unknown", None),
+        ("not_found", None),
+    ],
+)
+def test_succeeded_rejects_every_late_outcome(status, code):
+    p = payment()
+    now = p.created_at
+    identity = uuid4()
+    a = PaymentAttempt(
+        id=identity,
+        payment_id=p.id,
+        provider_idempotency_key=identity,
+        status="in_flight",
+        claim_version=1,
+        lease_until=now + timedelta(seconds=10),
+        safe_retry_until=now + timedelta(days=1),
+        created_at=now,
+        updated_at=now,
+    )
+    p = p.transition("processing", now).transition("succeeded", now)
+    result = ProviderResult(
+        status=status,
+        error_code=code,
+        external_id=uuid4() if status not in {"unknown", "not_found"} else None,
+    )
+    with pytest.raises(ValueError):
+        p.apply_result(a, result, now)
+    assert p.status == "succeeded"

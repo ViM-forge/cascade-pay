@@ -12,10 +12,12 @@ import signal
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import httpx
 from check_reconciliation_runtime import compose, payment_snapshot, provider_stats, response_json
+from duplicate_delivery import acknowledged, first_acknowledged
 from issue_demo_token import issue
 from redis.asyncio import Redis
 from sqlalchemy import text
@@ -109,7 +111,7 @@ async def run_recovery():
             children = Processes(directory)
             async with httpx.AsyncClient(timeout=5) as client:
 
-                async def create(mode="success"):
+                async def create(mode="success", *, concurrent=1):
                     ref = "recovery-" + str(uuid4())
                     await response_json(
                         client,
@@ -118,14 +120,24 @@ async def run_recovery():
                         headers=providers[0][1],
                         json={"charge_mode": mode},
                     )
-                    p = await response_json(
-                        client,
-                        "POST",
-                        api + "/payments",
-                        expected=202,
-                        headers=auth | {"Idempotency-Key": str(uuid4())},
-                        json=dict(amount_minor=123, currency="USD", payment_method_ref=ref),
+                    key = str(uuid4())
+                    responses = await asyncio.gather(
+                        *[
+                            response_json(
+                                client,
+                                "POST",
+                                api + "/payments",
+                                expected=202,
+                                headers=auth | {"Idempotency-Key": key},
+                                json=dict(
+                                    amount_minor=123, currency="USD", payment_method_ref=ref
+                                ),
+                            )
+                            for _ in range(concurrent)
+                        ]
                     )
+                    assert len({p["id"] for p in responses}) == 1
+                    p = responses[0]
                     return p["id"], ref
 
                 async def scan():
@@ -149,12 +161,25 @@ async def run_recovery():
                         for field in ("id", "provider_idempotency_key", "safe_retry_until"):
                             assert saved[field] == before[field], field
                     assert str(saved["id"]) == str(saved["provider_idempotency_key"])
-                    assert data["id"] == identity and data["attempts"][0]["id"] == str(saved["id"])
+                    assert data["id"] == identity and len(data["attempts"]) == 1
+                    assert data["attempts"][0]["id"] == str(saved["id"])
+                    assert saved["check_count"] <= s.reconciliation_max_checks
                     stats = [
                         await provider_stats(client, url, headers, method_ref=ref)
                         for url, headers in providers
                     ]
                     assert [x["ledger_count"] for x in stats] == [1, 0]
+                    assert stats[0]["ledger_amount_minor"] == 123
+                    key_stats = await provider_stats(
+                        client, *providers[0], key=str(saved["provider_idempotency_key"])
+                    )
+                    assert stats[0]["operations"] == [
+                        dict(
+                            key=str(saved["provider_idempotency_key"]),
+                            external_id=str(saved["external_id"]),
+                            status="succeeded",
+                        )
+                    ]
                     assert stats[1]["create_calls"] == stats[1]["lookup_calls"] == 0
                     result = dict(
                         case=label,
@@ -163,6 +188,10 @@ async def run_recovery():
                         provider_key=str(saved["provider_idempotency_key"]),
                         ledger=[1, 0],
                         a_create_calls=stats[0]["create_calls"],
+                        a_lookup_calls=key_stats["lookup_calls"],
+                        check_count=saved["check_count"],
+                        safe_retry_until=saved["safe_retry_until"].isoformat(),
+                        external_id=str(saved["external_id"]),
                     )
                     results.append(result)
                     print(json.dumps(result), flush=True)
@@ -268,8 +297,15 @@ async def run_recovery():
                             await proof(label, identity, ref, before)
                             canonical = await payment_snapshot(engine, identity)
                             if label == "late_owner":
+                                finished_marker = children.arm("after_result_commit", identity)
                                 children.release(marker)
-                                await asyncio.sleep(1)
+                                await children.reached(finished_marker)
+                                assert await payment_snapshot(engine, identity) == canonical
+                                children.release(finished_marker)
+                                original_task = json.loads(dict(entries_before)[original][b"data"])
+                                await acknowledged(
+                                    redis, SimpleNamespace(task_id=original_task["task_id"])
+                                )
                                 assert await payment_snapshot(engine, identity) == canonical
                                 await children.kill(second)
                             await children.kill(dispatcher)
@@ -278,7 +314,7 @@ async def run_recovery():
                         await children.kill(worker)
 
                     # Kill during a real HTTP request held by the provider, not a local callback.
-                    identity, ref = await create()
+                    identity, ref = await create(concurrent=10)
                     await response_json(
                         client,
                         "PUT",
@@ -289,6 +325,9 @@ async def run_recovery():
                             "barrier": "after_charge_commit_before_response",
                         },
                     )
+                    # A timeout may happen while duplicate ACKs are observed. Keep its
+                    # result uncommitted too, so SIGKILL precedes either result save.
+                    result_marker = children.arm("before_result_commit", identity)
                     await process.kiq(identity)
                     worker = await children.start("worker")
                     async with asyncio.timeout(15):
@@ -309,9 +348,30 @@ async def run_recovery():
                                 held_key = key
                                 break
                             await asyncio.sleep(0.01)
-                    await children.kill(worker)
-                    await scan()
+                    # Freeze the original reader too: it must not prefetch the duplicates
+                    # into its blocked process. The other consumer handles them deterministically.
+                    os.killpg(worker.pid, signal.SIGSTOP)
+                    duplicate_worker = await children.start("worker")
+                    tasks = [await process.kiq(identity) for _ in range(3)]
+                    await first_acknowledged(redis, tasks)
                     assert await payment_snapshot(engine, identity) == active
+                    stats = [
+                        await provider_stats(client, u, h, method_ref=ref) for u, h in providers
+                    ]
+                    assert stats[0]["ledger_count"] == stats[0]["create_calls"] == 1
+                    assert stats[1]["create_calls"] == stats[1]["lookup_calls"] == 0
+                    await children.kill(duplicate_worker)
+                    await children.kill(worker)
+                    children.release(result_marker)
+                    await scan()
+                    recovered = await payment_snapshot(engine, identity)
+                    for field in (
+                        "id",
+                        "provider_idempotency_key",
+                        "safe_retry_until",
+                        "check_count",
+                    ):
+                        assert recovered[field] == active[field], field
                     await response_json(
                         client,
                         "POST",
@@ -321,7 +381,7 @@ async def run_recovery():
                     )
                     dispatcher = await children.start("dispatcher")
                     worker = await children.start("worker")
-                    await proof("restart_active_http", identity, ref, active)
+                    await proof("combined_failures", identity, ref, active)
                     await children.kill(worker)
                     await children.kill(dispatcher)
                     # Providers restart independently while payment API remains available.
@@ -341,38 +401,74 @@ async def run_recovery():
                         await provider_stats(client, u, h, method_ref=ref) for u, h in providers
                     ] == stats
 
-                    # Fifth owner crashes; manual survives Redis/process/mock restart.
-                    identity, ref = await create("pending")
-                    await process.kiq(identity)
-                    worker = await children.start("worker")
-                    async with asyncio.timeout(15):
-                        while True:
-                            try:
-                                before = await payment_snapshot(engine, identity)
-                            except AssertionError:
+                    async def fifth_claim():
+                        identity, ref = await create("pending")
+                        await process.kiq(identity)
+                        worker = await children.start("worker")
+                        async with asyncio.timeout(15):
+                            while True:
+                                try:
+                                    before = await payment_snapshot(engine, identity)
+                                except AssertionError:
+                                    await asyncio.sleep(0.05)
+                                    continue
+                                if before["status"] == "unknown":
+                                    break
                                 await asyncio.sleep(0.05)
-                                continue
-                            if before["status"] == "unknown":
-                                break
-                            await asyncio.sleep(0.05)
-                    await children.kill(worker)
+                        await children.kill(worker)
+                        async with engine.begin() as c:
+                            await c.execute(
+                                text(
+                                    "UPDATE payment_attempts SET check_count=4, "
+                                    "next_check_at=clock_timestamp()-interval '1 second' "
+                                    "WHERE payment_id=:id"
+                                ),
+                                {"id": UUID(identity)},
+                            )
+                        marker = children.arm("after_claim", identity)
+                        await reconcile.kiq(identity)
+                        worker = await children.start("worker")
+                        await children.reached(marker)
+                        fifth = await payment_snapshot(engine, identity)
+                        assert fifth["check_count"] == 5 and fifth["lease_until"]
+                        await scan()
+                        assert await payment_snapshot(engine, identity) == fifth
+                        return identity, ref, marker, fifth, worker
+
+                    # A pending provider resolves once; its fifth live owner may save
+                    # the canonical success even after deadline, before lease expiry.
+                    identity, ref, marker, fifth, worker = await fifth_claim()
+                    await response_json(
+                        client,
+                        "POST",
+                        providers[0][0] + "/__test/operations/" + str(fifth["id"]) + "/resolve",
+                        headers=providers[0][1],
+                        json={"status": "succeeded", "error_code": None},
+                    )
                     async with engine.begin() as c:
                         await c.execute(
                             text(
-                                "UPDATE payment_attempts SET check_count=4, "
-                                "next_check_at=clock_timestamp()-interval '1 second' "
-                                "WHERE payment_id=:id"
+                                "UPDATE payment_attempts SET reconciliation_deadline="
+                                "clock_timestamp()-interval '1 second' WHERE payment_id=:id"
                             ),
                             {"id": UUID(identity)},
                         )
-                    marker = children.arm("after_claim", identity)
-                    await reconcile.kiq(identity)
-                    worker = await children.start("worker")
-                    await children.reached(marker)
                     fifth = await payment_snapshot(engine, identity)
-                    assert fifth["check_count"] == 5 and fifth["lease_until"]
                     await scan()
                     assert await payment_snapshot(engine, identity) == fifth
+                    children.release(marker)
+                    await proof("fifth_owner_success_after_deadline", identity, ref, fifth)
+                    final = await payment_snapshot(engine, identity)
+                    assert final["check_count"] == 5 and not final["manual_review_required"]
+                    assert final["reconciliation_deadline"] == fifth["reconciliation_deadline"]
+                    stats = await provider_stats(client, *providers[0], method_ref=ref)
+                    assert (
+                        stats["lookup_calls"] == 1
+                    )  # count4 is a SQL fixture, not four HTTP calls.
+                    await children.kill(worker)
+
+                    # Fifth owner crashes; manual survives Redis/process/mock restart.
+                    identity, ref, marker, fifth, worker = await fifth_claim()
                     await children.kill(worker)
                     children.release(marker)
                     dispatcher = await children.start("dispatcher")
