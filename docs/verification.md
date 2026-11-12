@@ -779,3 +779,87 @@ xread_count, due при expiry, manual marker, health и host API_URL, пове�
 Integration, Docker build/runtime, crash matrix, clean checkout и нагрузка
 в этом аудите не запускались. Код поведения, конфигурация и зависимости не
 менялись. Staging и Git-коммиты не выполнялись.
+
+
+## Подготовка передачи: чистая копия — 2026-11-12
+
+Проверка начата из чистого рабочего дерева HEAD `4dbc67c`. Экспортированы только
+отслеживаемые файлы с текущими изменениями README и новым `scripts/demo-recovery.sh`,
+подготовленным к добавлению пользователем; Git-коммит не создавался.
+В копии нет исходных .env, .venv и внутренних документов автора. Созданы новые
+случайные секреты (0600), новый venv и пустой PostgreSQL volume
+`cascade-delivery-check_postgres-data`, отдельный project `cascade-delivery-check`
+и образ `cascade-payments:delivery-check`. Рабочий `cascade-bootstrap-check`
+не останавливался, его данные не очищались.
+
+Из-за занятых рабочих портов использован временный override только host-портов
+и имени образа: PostgreSQL 25432, Redis 26379, API 28000, mock 28001/28002.
+Host URL нового .env согласованы с ними; COMPOSE_FILE указывает на compose.yaml
+и временный override с !override для ports. Версия Compose 5.2.0.
+Обычный запуск на стандартных портах одновременно с рабочим проектом не выполнялся.
+Последовательность README сохранена; подмена портов — явное ограничение проверки.
+
+| Фактическая команда / проверка | Результат |
+|---|---|
+| `python3.13 scripts/configure_local.py` | новый .env, mode0600 |
+| `POETRY_VIRTUALENVS_IN_PROJECT=true poetry env use python3.13`, `poetry sync --with dev` | новый venv, установка lock успешна |
+| `docker compose config -q`, `docker compose build` | exit0 |
+| `docker compose up -d --wait postgres redis` | новый volume, healthy |
+| `docker compose run --rm migrate`, `migrate-mock-a`, `migrate-mock-b` | все exit0 |
+| `docker compose up -d --wait api worker dispatcher mock-a mock-b` | семь сервисов healthy |
+| curl live/ready API и обоих mock на портах копии | все HTTP200 |
+| `poetry check`, `poetry run ruff check .`, `poetry run ruff format --check .` | exit0; 68 файлов |
+| `RUN_INTEGRATION=1 API_URL=http://127.0.0.1:28000 poetry run pytest -q` | **299 passed, 0 skipped, 93.60с** |
+| `docker compose --profile demo run --rm demo first-success` | succeeded, A/B ledger1/0, сумма123 |
+| `... demo cascade-success` | A declined/B succeeded, ledger0/1 |
+| `... demo all-declined` | failed, ledger0/0 |
+| `... demo lost-response` | наблюдаемый unknown/null → succeeded, create1/0, lookup1, ledger1/0 |
+| `... demo duplicate-delivery` | 10 POST, один UUID, настоящий Taskiq noop ACK при удержанном HTTP, create1/0, ledger1/0 |
+| `API_URL=http://127.0.0.1:28000 sh scripts/demo-recovery.sh` | exit0, все 11 аварийных cases |
+
+D6 подтвердил commit_before_publish, publish_before_mark, published_redis_loss,
+claim_before_http, claim_before_ack_reclaim, charge_before_result, late_owner,
+commit_before_ack_reclaim, combined_failures, fifth_owner_success_after_deadline
+и fifth_claim_manual_restart. Исходные payment/attempt/key/window сохранялись;
+SQL-fixture count4 в двух cases не считается четырьмя реальными lookup.
+
+При проверке инструкции обнаружен и передан другому агенту конфликт
+стандартного API8000 с default host pytest18000. Исправлены две команды README:
+они явно выбирают 8000 и сохраняют экспортированный API_URL. Подстановки
+8000/28000 проверены отдельно. Финансовый код, конфигурация и lock не менялись.
+
+Дополнительно последовательно, после D6:
+
+- `API_URL=http://127.0.0.1:28000 poetry run python scripts/check_idempotency_runtime.py`: exit0; queued3, разные PID, конкурентный дубль B, create1/1, ledger0/1.
+- `API_URL=http://127.0.0.1:28000 poetry run python scripts/check_first_payment_runtime.py`: exit0; устойчивые финалы после restart, прежний key, ledger1, production controls404, safe_logs passed.
+- `API_URL=http://127.0.0.1:28000 poetry run python scripts/check_reconciliation_runtime.py`: exit0; пять настоящих lookup, manual с next=NULL после restart и дублей, без нового HTTP; восемь canonical финалов A/B.
+- `python3.13 /tmp/cascade-delivery-lifecycle.py` в копии: exit0. Вспомогательная проверка через Compose/HTTP/psql подтвердила Gunicorn master + 2 worker, отсутствие dispatcher в API, запрет межбазового CONNECT; при stop Redis/PostgreSQL live200/ready503 и восстановление. Все пять application-сервисов при stop получили ExitCode0 без OOM. После stop/start самой БД совпали fingerprints терминальных payments и обоих ledger. Повторены все три migration-команды: payments revision0002, mock revision mock_0004; данные неизменны. Семь сервисов снова healthy. Это эквивалентная проверка lifecycle с портами копии; оригинальный check_bootstrap.py с hardcoded mock8001/8002 отдельно не запускался.
+
+Новые подтверждённые нарушения SOLID/DRY/YAGNI не выявлены при просмотре domain/application imports, портов, orchestration use cases, repository, scheduling и dispatcher. Правила каскада общие для finish/recovery, начальные A/B создаёт один helper, SQL-готовность сверки общая; доменная перепроверка после locks сохраняется. Это ограниченное ревью конкретных компонентов, не доказательство отсутствия всех дефектов.
+
+Итоговые проверки после runtime:
+
+| Команда / действие | Результат |
+|---|---|
+| `docker compose run --rm -e RUN_INTEGRATION=1 -e API_URL=http://api:8000 api pytest -q` | **299 passed, 0 skipped, 87.92с**, exit0 |
+| `python3.13 /tmp/cascade-delivery-final.py` | пример POST/GET из README через sh -e: exit0; недоступный API в CLI: nonzero; invalid scenario: exit2; повтор генератора .env: nonzero, содержимое и mode0600 сохранены |
+| просмотр и скриптовая проверка всех application-логов | созданных signing/service/DB credentials и JWT нет; first-payment runtime также проверил ref |
+| финальные Poetry check, Ruff lint/format в копии | exit0, 68 файлов |
+| локальные Markdown-ссылки, список tracked файлов, private-key/JWT scan | отсутствующих файлов и кандидатов не найдено; .env/venv/логи/внутренние материалы не отслеживаются |
+| `sh -n scripts/demo-recovery.sh`, `git diff --check` | exit0 |
+| `docker compose -p cascade-delivery-check down -v --remove-orphans` в копии | exit0, удалён только тестовый project и его новый volume |
+| `docker compose ps` рабочего проекта и `docker volume ls` | семь исходных сервисов healthy; исходный PostgreSQL volume сохранён, тестовый удалён |
+
+JWT positive/negative, merchant isolation, lease/fencing, timeout/not_found без B,
+поздние результаты, manual и test-only controls проверены полными unit/integration/e2e
+и runtime, указанными выше; связь гарантий с тестами — [acceptance](acceptance.md).
+Невыполненных обязательных проверок в пределах MVP нет. Новых открытых проблем
+не осталось. Новый wrapper необходимо включить в пользовательский коммит вместе
+с README и этим отчётом. Staging, commit, публикация и отправка не выполнялись.
+
+Граница доказанного: запуск выполнен из экспорта файлов кандидата сдачи,
+со свежими секретами/venv/volume и указанной заменой занятых портов; это не clone
+будущего пользовательского коммита. Dependency/container cache использован;
+скачивание всех пакетов с нулевым сетевым cache не проверялось. Host Python 3.13.13,
+Docker Python 3.13.9. Unix runtime; Windows, нагрузка/SLA, потеря PostgreSQL volume,
+реальные деньги/провайдеры не проверялись. Mock-контракт необходим для гарантий ledger.

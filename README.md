@@ -5,7 +5,10 @@ HTTP mock A/B → GET с историей попыток. Доступны JWT, 
 устойчивые отказы, независимые ledger mock A/B и ограниченная сверка unknown.
 Восстановление незавершённой обработки идёт из PostgreSQL. Реальные деньги не используются.
 
-Нужны Docker Desktop/Engine с Compose v2. Для локальной разработки — Python 3.13
+Нужны Docker Desktop/Engine с Compose v2 и Python 3.13 на хосте
+для генерации настроек; D6 также требует Poetry и Unix.
+Свободные loopback-порты: 5432, 6379, 8000, 8001, 8002; runtime smoke также 18001.
+Для локальной разработки — Python 3.13
 и Poetry **2.2.1** (для установки командой ниже нужен uv). В Docker: Python 3.13.9, PostgreSQL 17.6, Redis 7.4.6.
 Python-зависимости и хеши пакетов закреплены в `poetry.lock`.
 
@@ -38,8 +41,10 @@ URL-пароли должны быть percent-encoded; генератор ис�
 
 Если порт 8000 занят, добавьте `API_PORT=18000` в `.env`, используйте этот порт
 в curl и передайте `--api-port 18000` скрипту check_bootstrap.py.
-Для host-only runtime ниже API_URL по умолчанию равен `http://127.0.0.1:18000`;
-если API работает на стандартном порту 8000, перед запуском задайте
+У HTTP-тестов и host-only runtime внутреннее значение API_URL по умолчанию —
+`http://127.0.0.1:18000`. Команды pytest ниже явно выбирают стандартный порт 8000,
+если API_URL не задан. Для другого API_PORT перед проверками задайте, например,
+`export API_URL=http://127.0.0.1:18000`; для runtime со стандартным запуском —
 `export API_URL=http://127.0.0.1:8000`. Внутри Compose используется `http://api:8000`.
 
 Init-скрипт выполняется PostgreSQL только на новом volume. Он создаёт отдельные
@@ -76,13 +81,13 @@ Redis — транспорт, PostgreSQL — источник истины. Work
 ```sh
 uv tool install poetry==2.2.1 --python python3.13
 POETRY_VIRTUALENVS_IN_PROJECT=true poetry env use python3.13
-poetry sync
+poetry sync --with dev
 poetry check
 poetry run ruff check .
 poetry run ruff format --check .
 poetry run pytest -q
 # При работающих Compose PostgreSQL/Redis и применённых миграциях:
-RUN_INTEGRATION=1 poetry run pytest -q
+RUN_INTEGRATION=1 API_URL="${API_URL:-http://127.0.0.1:8000}" poetry run pytest -q
 # Или все тесты из общего Docker image:
 docker compose run --rm -e RUN_INTEGRATION=1 -e API_URL=http://api:8000 api pytest -q
 # Нарушает доступность зависимостей на время smoke-проверки:
@@ -134,6 +139,25 @@ poetry run python scripts/issue_demo_token.py --merchant 1
 poetry run python scripts/issue_demo_token.py --merchant 2
 ```
 
+Пример ручного POST/GET после локальной установки (токен остаётся в shell-переменной):
+
+```sh
+DEMO_TOKEN=$(poetry run python scripts/issue_demo_token.py --merchant 1)
+PAYMENT_ID=$(curl --fail --silent "${API_URL:-http://localhost:8000}/payments" \
+  -H "Authorization: Bearer $DEMO_TOKEN" \
+  -H "Idempotency-Key: manual-$(python3.13 -c 'import uuid; print(uuid.uuid4())')" \
+  -H 'Content-Type: application/json' \
+  -d '{"amount_minor":123,"currency":"USD","payment_method_ref":"manual-demo"}' \
+  | python3.13 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl --fail --silent "${API_URL:-http://localhost:8000}/payments/$PAYMENT_ID" \
+  -H "Authorization: Bearer $DEMO_TOKEN"
+unset DEMO_TOKEN
+```
+
+GET можно повторять до финального статуса; автоматический ограниченный polling
+и проверку ledger выполняют CLI-демо. Не включайте shell tracing (`set -x`)
+при работе с токеном.
+
 POST /payments принимает Bearer JWT, единственный Idempotency-Key из 1..128 видимых
 ASCII символов и JSON с ровно amount_minor (положительный integer до BIGINT max),
 currency (USD, регистр нормализуется), payment_method_ref (1..255 без пробелов и
@@ -146,7 +170,7 @@ currency (USD, регистр нормализуется), payment_method_ref (1
 ```sh
 # Локально .env должен указывать на опубликованные PostgreSQL/Redis/mock порты.
 # Для другого API_PORT задайте API_URL=http://127.0.0.1:<порт>.
-RUN_INTEGRATION=1 poetry run pytest -q
+RUN_INTEGRATION=1 API_URL="${API_URL:-http://127.0.0.1:8000}" poetry run pytest -q
 # Host-only: временно останавливает только mock-a этого Compose проекта;
 # создаёт отдельный production mock на свободном localhost:18001 и удаляет его.
 poetry run python scripts/check_first_payment_runtime.py
@@ -313,7 +337,7 @@ published_at, с сетевым timeout. Ошибка оставляет соб�
 D6 запускается **на хосте**, отдельно от pytest и других runtime-скриптов:
 
 ```sh
-API_URL=http://127.0.0.1:18000 poetry run python scripts/demo.py restart-recovery
+sh scripts/demo-recovery.sh
 # та же полная матрица напрямую:
 poetry run python scripts/check_recovery_runtime.py
 ```
@@ -360,3 +384,22 @@ lookup один и ledger=1, в crash-before-HTTP lookup=0. Пять реаль�
 отсутствие шестого отдельно проверяют pytest и reconciliation runtime.
 Запускайте runtime последовательно, отдельно от pytest; команды и результаты
 приведены в [verification](docs/verification.md).
+
+## Передача и сброс демонстрационного окружения
+
+D1–D5 запускаются командами выше, D6 — `sh scripts/demo-recovery.sh`
+после установки локальных зависимостей. Для нестандартного API_PORT передайте
+`API_URL=http://127.0.0.1:<порт> sh scripts/demo-recovery.sh`.
+D6 использует ту же полную аварийную матрицу; отдельный финансовый алгоритм
+для оболочки не создаётся. Все демо возвращают ненулевой код при нарушении assertions.
+
+Обычная остановка сохраняет данные: `docker compose stop`.
+Для полного сброса **только выделенного test/demo проекта**, когда его данные
+больше не нужны, разрушительная команда: `docker compose down -v --remove-orphans`.
+Она удаляет PostgreSQL volume выбранного проекта, платежи и ledger.
+Никогда не используйте её для рабочего окружения. Затем повторите миграции и запуск.
+
+Для передачи нужны отслеживаемые файлы Git и собственный `.env` получателя.
+Ограничения MVP и шесть решений описаны в [decisions](docs/decisions.md):
+S3 не реализован, реальные деньги, PCI, production-ready и RPS не заявляются.
+JWT HS256 не имеет refresh/revocation, ротации и отдельного IdP.
