@@ -635,3 +635,110 @@ Production-код и зависимости не менялись.
 SQL fixtures count4/deadline не являются HTTP-вызовами. Нагрузка/SLA, реальные
 деньги, потеря PostgreSQL volume, Windows runtime и финальный clean checkout
 не проверялись. Exactly-once транспорта не заявляется.
+
+
+## Ревью SOLID, DRY, YAGNI и удаление прежнего scheduler — 2026-11-12
+
+Удалена `dispatcher.publish_due`: после перехода на DB recovery рабочий цикл
+вызывает `recover_batch` и `publish_one`, прежнюю функцию вызывали только тесты.
+Проверки due/lease/manual и повтора после сбоя перенесены на `publish_one` с
+настоящим PostgreSQL и подменой только границы публикации Taskiq. Удалён один
+тест batch старого пути; batch=20 действующего recovery проверяет
+`test_recovery.py::test_batch_rotates_and_does_not_grow_unpublished_outbox`.
+Рабочий протокол отправки и финансовые переходы не изменены.
+
+| Выполненная команда | Результат |
+|---|---|
+| `poetry check` | exit 0 |
+| `poetry run ruff check .` | exit 0 |
+| `poetry run ruff format --check .` | exit 0, 67 файлов |
+| `RUN_INTEGRATION=1 API_URL=http://127.0.0.1:18000 poetry run pytest -q tests/integration/test_reconciliation_transport.py tests/integration/test_dispatcher_event_types.py tests/integration/test_recovery.py` | 20 passed, 1.27с |
+| `RUN_INTEGRATION=1 API_URL=http://127.0.0.1:18000 poetry run pytest -q` | 285 passed, 0 skipped, 88.36с |
+| `git diff --check` | exit 0 |
+
+Подтверждённые DRY-долги KI-05/KI-06 записаны в [known-issues](known-issues.md):
+два SQL-предиката готовности unknown и две инициализации попытки.
+Их рефакторинг не выполнялся. Подтверждённых нарушений SOLID, требующих изменения
+архитектуры согласованного MVP, не выявлено; это результат ревью, а не гарантия
+отсутствия всех дефектов. YAGNI: удалён заменённый scheduler без добавления слоёв.
+
+Тесты выполнялись локальным кодом на работающем Compose-окружении.
+Docker-образ в этом этапе не пересобирался, отдельный crash-runtime не запускался,
+чистый checkout и финальная сдача повторно не проверялись.
+
+
+## Исправление KI-05/KI-06 — 2026-11-12
+
+Независимая проверка подтвердила оба дублирования в текущем коде; расхождений
+условий и полей не было. SQL-готовность unknown теперь определена в
+`infrastructure/scheduling.py`, начальные поля A/B — в приватном конструкторе
+репозитория. Блокировки, транзакции, доменные перепроверки, ключи и окна повторов
+сохранены. Правила сопровождения — в [decisions.md](decisions.md#сопровождение-sql-отбора-и-создания-попыток).
+Обе записи удалены из known-issues после проверки; новых проблем не обнаружено.
+
+Использован существующий Compose project `cascade-bootstrap-check`, API 18000.
+Исходные незакоммиченные изменения прежнего ревью сохранены. PostgreSQL/Redis
+volumes не удалялись; конфигурация, зависимости и lock не менялись.
+
+| Реально выполненная команда | Результат |
+|---|---|
+| `RUN_INTEGRATION=1 API_URL=http://127.0.0.1:18000 poetry run pytest -q tests/integration/test_recovery.py tests/integration/test_reconciliation_transport.py tests/integration/test_initial_window_db.py tests/integration/test_reconciliation_db.py` | 49 passed, 2.18с; до добавления пяти дополнительных проверок точных SQL-границ |
+| `docker compose build api` | exit 0, общий образ с изменённым production-кодом собран |
+| `docker compose up -d --wait api worker dispatcher mock-a mock-b` | exit 0, все семь сервисов healthy |
+| `RUN_INTEGRATION=1 API_URL=http://127.0.0.1:18000 poetry run pytest -q` | **299 passed, 0 skipped, 88.75с**; все 14 новых регрессий включены |
+| `poetry check` | exit 0 |
+| `poetry run ruff check .` | exit 0 |
+| `poetry run ruff format --check .` | exit 0, 68 файлов |
+| `git diff --check` | exit 0 |
+
+Полный pytest выполнен локально против пересобранных application-сервисов:
+DB integration и HTTP/Taskiq e2e запускались, а не пропускались. Новые проверки
+recovery изолированы временными таблицами; SQL-границы проверены с фиксированным
+временем БД и лимитом 3. Проверка A → B подтверждает flush терминальной A,
+начальные поля обеих попыток и сохранение исходного key/window при prepare/finish.
+Отдельный pytest внутри Docker, crash-runtime, чистый checkout, нагрузка и
+реальные провайдеры/деньги в этом этапе не проверялись. Exactly-once транспорта
+не заявляется. Коммиты агент не создавал.
+
+### Независимая повторная валидация перед коммитом — 2026-11-12
+
+Прочитан весь текущий diff и новая `scheduling.py`, сопоставлены старые/новые
+SQL-условия и конструкторы A/B. Замена сохраняет приоритет live lease/manual,
+выбор exhausted до due, явные часы и лимит; доменный claim остаётся после locks.
+Создание UUID/key/window и порядок terminal-A flush → insert-B не изменены.
+Рефакторинг не добавляет новые зависимости и не меняет направление к domain/application.
+Удалённый publish_due не имел вызовов в рабочем цикле; действующий recovery batch
+и publisher покрыты текущими тестами. Подтверждённых новых дефектов и архитектурных
+развилок не выявлено. Production-код при этой повторной проверке не редактировался.
+
+Проверено незакоммиченное рабочее дерево поверх HEAD `c2aa251`, включая новый
+неотслеживаемый `src/payments/infrastructure/scheduling.py`. Этот файл должен войти
+в коммит, поскольку publisher/repository уже импортируют его.
+
+| Самостоятельно выполненная проверка | Результат |
+|---|---|
+| `RUN_INTEGRATION=1 API_URL=http://127.0.0.1:18000 .venv/bin/pytest -q` | 299 passed in 88.57s (0:01:28); без skipped |
+| `.venv/bin/ruff check .` | exit0 |
+| `.venv/bin/ruff format --check .` | exit0, 68 файлов |
+| `poetry check` | exit0 |
+| `git diff --check` | exit0 |
+| `API_URL=http://127.0.0.1:18000 .venv/bin/python scripts/check_recovery_runtime.py` | exit0, 11 аварийных cases |
+| `API_URL=http://127.0.0.1:18000 .venv/bin/python scripts/check_reconciliation_runtime.py` | exit0; 5 настоящих lookup, manual после restart, без шестого HTTP; 8 canonical finals A/B |
+| `docker compose build api` | exit0 |
+| `docker compose run --rm -e RUN_INTEGRATION=1 -e API_URL=http://api:8000 api pytest -q` | 299 passed in 91.05s (0:01:31); без skipped |
+
+Аварии процессов, Redis-loss, recovery и полный pytest запускались строго
+последовательно. Сверка SHA256 файлов repository.py, scheduling.py, dispatcher.py
+в работающих api/worker/dispatcher подтвердила совпадение с рабочим деревом.
+Первую попытку этой вспомогательной сверки преждевременно запустили во время
+аварийного runtime: api совпал, exec в остановленный worker вернул ненулевой код.
+После восстановления сервисов вся сверка повторена успешно. Это ошибка порядка
+вспомогательной проверки, не отказ платёжного сценария. Основные pytest/runtime
+в этой повторной валидации прошли с первого запуска.
+
+Блокирующих замечаний к коммиту не обнаружено. Пользовательские изменения
+сохранены; Git-коммиты и staging агент не выполнял. PostgreSQL volume сохранён,
+сервисы восстановлены healthy. Сведения прежних проверок выше остаются историей.
+Чистый checkout/финальная передача, нагрузка и реальные провайдеры этим повтором
+не проверялись; гарантия ledger зависит от mock-контракта. SQL count4/deadline
+в аварийных граничных fixtures не выдаются за фактические HTTP lookup.

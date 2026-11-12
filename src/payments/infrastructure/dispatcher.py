@@ -9,22 +9,8 @@ from payments.infrastructure.db import create_engine, session_factory
 from payments.infrastructure.fault_control import barrier
 from payments.infrastructure.orm import AttemptRow, OutboxRow
 from payments.infrastructure.repository import PaymentRepository
+from payments.infrastructure.scheduling import reconciliation_ready
 from payments.infrastructure.worker import broker, process, reconcile, settings
-
-
-def reconciliation_ready():
-    """Outbox reconciliation readiness; domain claim remains authoritative."""
-    now = func.clock_timestamp()
-    return and_(
-        AttemptRow.status == "unknown",
-        AttemptRow.manual_review_required.is_(False),
-        or_(AttemptRow.lease_until.is_(None), AttemptRow.lease_until <= now),
-        or_(
-            AttemptRow.check_count >= settings.reconciliation_max_checks,
-            AttemptRow.reconciliation_deadline <= now,
-            AttemptRow.next_check_at <= now,
-        ),
-    )
 
 
 async def publish_one(sessions):
@@ -42,7 +28,13 @@ async def publish_one(sessions):
                 OutboxRow.published_at.is_(None),
                 or_(
                     OutboxRow.event_type == "process_payment",
-                    and_(OutboxRow.event_type == "reconcile_payment", reconciliation_ready()),
+                    and_(
+                        OutboxRow.event_type == "reconcile_payment",
+                        reconciliation_ready(
+                            now=func.clock_timestamp(),
+                            max_checks=settings.reconciliation_max_checks,
+                        ),
+                    ),
                 ),
             )
             .order_by(OutboxRow.created_at)
@@ -63,24 +55,6 @@ async def publish_one(sessions):
             .values(published_at=func.clock_timestamp(), updated_at=func.clock_timestamp())
         )
     return True
-
-
-async def publish_due(sessions):
-    # Revisit persisted unknown schedules even after an outbox was published or
-    # a reconciliation owner crashed. No pending/created/in-flight recovery here.
-    async with sessions() as session:
-        identities = (
-            await session.scalars(
-                select(AttemptRow.payment_id)
-                .where(reconciliation_ready())
-                .order_by(AttemptRow.next_check_at, AttemptRow.id)
-                .limit(20)
-            )
-        ).all()
-    async with asyncio.timeout(settings.http_timeout_seconds):
-        for identity in identities:
-            await reconcile.kiq(str(identity))
-    return len(identities)
 
 
 async def main():

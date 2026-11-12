@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert
 from payments.application.ports import Conflict
 from payments.domain.models import Payment, PaymentAttempt, request_hash
 from payments.infrastructure.orm import AttemptRow, OutboxRow, PaymentRow
+from payments.infrastructure.scheduling import reconciliation_ready
 
 
 def payment_entity(row):
@@ -145,15 +146,8 @@ class PaymentRepository:
                 or_(
                     AttemptRow.status == "created",
                     and_(AttemptRow.status == "in_flight", AttemptRow.lease_until <= now),
-                    and_(
-                        AttemptRow.status == "unknown",
-                        AttemptRow.manual_review_required.is_(False),
-                        or_(AttemptRow.lease_until.is_(None), AttemptRow.lease_until <= now),
-                        or_(
-                            AttemptRow.next_check_at <= now,
-                            AttemptRow.check_count >= self.settings.reconciliation_max_checks,
-                            AttemptRow.reconciliation_deadline <= now,
-                        ),
+                    reconciliation_ready(
+                        now=now, max_checks=self.settings.reconciliation_max_checks
                     ),
                 ),
             )
@@ -233,6 +227,27 @@ class PaymentRepository:
             p.updated_at = now  # Fair rotation and bounded republication frequency.
         return len(rows)
 
+    def _new_attempt(self, *, payment_id, sequence, provider, now):
+        """Allocate a new operation, never rebuild or retry an existing one.
+
+        Retries must load the saved key/window. Callers own add/flush/enqueue
+        and transactions, including flushing terminal A before inserting B
+        to respect the one-active-attempt constraint.
+        """
+        key = uuid4()
+        return AttemptRow(
+            id=key,
+            payment_id=payment_id,
+            sequence=sequence,
+            provider=provider,
+            provider_idempotency_key=key,
+            status="created",
+            claim_version=0,
+            safe_retry_until=now + timedelta(seconds=self.settings.safe_retry_seconds),
+            created_at=now,
+            updated_at=now,
+        )
+
     async def prepare(self, identity):
         p, a = await self.locked(identity)
         if p is None or p.status in {"succeeded", "failed"}:
@@ -243,18 +258,8 @@ class PaymentRepository:
             if entity.status != "processing":
                 entity = entity.transition("processing", now)
             p.status, p.updated_at = entity.status, now
-            key = uuid4()
-            a = AttemptRow(
-                id=key,
-                payment_id=p.id,
-                sequence=1,
-                provider=p.routing_snapshot[0],
-                provider_idempotency_key=key,
-                status="created",
-                claim_version=0,
-                safe_retry_until=now + timedelta(seconds=self.settings.safe_retry_seconds),
-                created_at=now,
-                updated_at=now,
+            a = self._new_attempt(
+                payment_id=p.id, sequence=1, provider=p.routing_snapshot[0], now=now
             )
             self.session.add(a)
             await self.session.flush()
@@ -352,19 +357,9 @@ class PaymentRepository:
 
     async def save_payment_result(self, p, a, payment, next_provider, now):
         if next_provider:
-            key = uuid4()
             self.session.add(
-                AttemptRow(
-                    id=key,
-                    payment_id=p.id,
-                    sequence=a.sequence + 1,
-                    provider=next_provider,
-                    provider_idempotency_key=key,
-                    status="created",
-                    claim_version=0,
-                    safe_retry_until=now + timedelta(seconds=self.settings.safe_retry_seconds),
-                    created_at=now,
-                    updated_at=now,
+                self._new_attempt(
+                    payment_id=p.id, sequence=a.sequence + 1, provider=next_provider, now=now
                 )
             )
             self.enqueue("process_payment", p.id, now)

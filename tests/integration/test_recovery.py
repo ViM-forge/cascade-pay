@@ -201,3 +201,95 @@ async def test_processing_history_uses_canonical_outcome(status, code, expected)
         payment, attempt = await repo.locked(identity)
         assert payment.status == expected
         assert attempt.provider == ("B" if expected == "processing" else "A")
+
+
+@pytest.mark.parametrize(
+    "lease,due,count,deadline,manual,expected",
+    [
+        (60, -1, 5, -1, False, "noop"),
+        (None, -1, 5, -1, True, "noop"),
+        (None, 60, 1, 60, False, "noop"),
+        (None, 60, 5, 60, False, "manual"),
+        (-1, 60, 1, -1, False, "manual"),
+        (None, None, 5, 60, False, "manual"),
+        (None, None, 1, -1, False, "manual"),
+        (-1, -1, 1, 60, False, "claim"),
+    ],
+)
+async def test_unknown_recovery_readiness(lease, due, count, deadline, manual, expected):
+    async with isolated() as (session, repo):
+        identity, row = await seed(session, repo, "unknown")
+        now = await session.scalar(text("SELECT clock_timestamp()"))
+        row.lease_until = None if lease is None else now + timedelta(seconds=lease)
+        row.next_check_at = None if due is None else now + timedelta(seconds=due)
+        row.check_count = count
+        row.reconciliation_deadline = now + timedelta(seconds=deadline)
+        row.manual_review_required = manual
+        await session.flush()
+        before = attempt_entity(row)
+        assert (
+            before.reconciliation_action(now, repo.settings.reconciliation_max_checks) == expected
+        )
+        assert await repo.recover_batch() == (expected != "noop")
+        await session.flush()
+        _, row = await repo.locked(identity)
+        assert (row.id, row.provider_idempotency_key, row.safe_retry_until) == (
+            before.id,
+            before.provider_idempotency_key,
+            before.safe_retry_until,
+        )
+        if expected == "noop":
+            assert attempt_entity(row) == before
+        else:
+            assert row.manual_review_required == (expected == "manual")
+        events = (
+            await session.scalars(
+                select(OutboxRow).where(
+                    OutboxRow.payment_id == identity, OutboxRow.published_at.is_(None)
+                )
+            )
+        ).all()
+        assert [event.event_type for event in events] == (
+            ["reconcile_payment"] if expected == "claim" else []
+        )
+
+
+async def test_new_attempt_initialization_and_saved_window_survive_cascade():
+    async with isolated() as (session, repo):
+        identity, first = await seed(session, repo)
+        original_key, original_window = first.id, first.safe_retry_until
+        assert first.provider == "A" and first.sequence == 1
+        assert first.provider_idempotency_key == original_key
+        assert first.status == "created" and first.claim_version == 0
+        assert first.created_at == first.updated_at
+        assert first.safe_retry_until - first.created_at == timedelta(
+            seconds=repo.settings.safe_retry_seconds
+        )
+        await repo.prepare(identity)
+        _, claimed = await repo.claim(identity)
+        assert await repo.finish(
+            claimed,
+            ProviderResult(
+                status="declined_retryable", error_code="issuer_unavailable", external_id=uuid4()
+            ),
+        )
+        await session.flush()  # Also exercises the partial UNIQUE during A → B.
+        _, second = await repo.locked(identity)
+        assert first.status == "declined"
+        assert (first.id, first.provider_idempotency_key, first.safe_retry_until) == (
+            original_key,
+            original_key,
+            original_window,
+        )
+        assert second.provider == "B" and second.sequence == 2
+        assert second.id == second.provider_idempotency_key != original_key
+        assert second.status == "created" and second.claim_version == 0
+        assert second.check_count == 0 and not second.manual_review_required
+        assert second.created_at == second.updated_at
+        assert second.safe_retry_until - second.created_at == timedelta(
+            seconds=repo.settings.safe_retry_seconds
+        )
+        second_window = second.safe_retry_until
+        await repo.prepare(identity)
+        assert second.safe_retry_until == second_window
+        assert len((await session.scalars(select(AttemptRow))).all()) == 2

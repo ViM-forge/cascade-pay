@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from payments.infrastructure import dispatcher
 from payments.infrastructure.db import create_engine
-from payments.infrastructure.orm import AttemptRow
+from payments.infrastructure.orm import AttemptRow, OutboxRow
 from payments.infrastructure.settings import load_settings
 
 pytestmark = [
@@ -75,6 +75,23 @@ def scheduled_attempt(now, **changes):
     )
 
 
+async def enqueue_reconciliation(connection, rows, now):
+    await connection.execute(
+        insert(OutboxRow),
+        [
+            dict(
+                id=uuid4(),
+                event_type="reconcile_payment",
+                payment_id=row["payment_id"],
+                payload={"payment_id": str(row["payment_id"])},
+                created_at=now,
+                updated_at=now,
+            )
+            for row in rows
+        ],
+    )
+
+
 async def test_due_selection_preserves_live_owner_and_selects_exhausted_before_due(monkeypatch):
     async with isolated_schedule() as (connection, sessions, now):
         rows = [
@@ -100,6 +117,7 @@ async def test_due_selection_preserves_live_owner_and_selects_exhausted_before_d
             scheduled_attempt(now, status="declined", external_id=uuid4()),
         ]
         await connection.execute(insert(AttemptRow), rows)
+        await enqueue_reconciliation(connection, rows, now)
         before = (await connection.execute(select(AttemptRow).order_by(AttemptRow.id))).all()
         publications = []
 
@@ -107,32 +125,20 @@ async def test_due_selection_preserves_live_owner_and_selects_exhausted_before_d
             publications.append(identity)
 
         monkeypatch.setattr(dispatcher.reconcile, "kiq", publish)
-        await dispatcher.publish_due(sessions)
+        for _ in range(4):
+            assert await dispatcher.publish_one(sessions)
+        assert not await dispatcher.publish_one(sessions)
         assert set(publications) == {str(rows[i]["payment_id"]) for i in (0, 4, 5, 6)}
         assert len(publications) == 4
         after = (await connection.execute(select(AttemptRow).order_by(AttemptRow.id))).all()
         assert after == before  # Scheduling cannot claim or reset persisted limits.
 
 
-async def test_due_publications_are_bounded(monkeypatch):
-    async with isolated_schedule() as (connection, sessions, now):
-        rows = [scheduled_attempt(now) for _ in range(25)]
-        await connection.execute(insert(AttemptRow), rows)
-        publications = []
-
-        async def publish(identity):
-            publications.append(identity)
-
-        monkeypatch.setattr(dispatcher.reconcile, "kiq", publish)
-        await dispatcher.publish_due(sessions)
-        assert len(publications) == len(set(publications)) == 20
-        assert set(publications) <= {str(row["payment_id"]) for row in rows}
-
-
 async def test_due_publication_failure_keeps_schedule_for_next_pass(monkeypatch):
     async with isolated_schedule() as (connection, sessions, now):
         row = scheduled_attempt(now)
         await connection.execute(insert(AttemptRow), row)
+        await enqueue_reconciliation(connection, [row], now)
         publications = []
 
         async def publish(identity):
@@ -141,13 +147,41 @@ async def test_due_publication_failure_keeps_schedule_for_next_pass(monkeypatch)
                 raise TimeoutError("test publication failure")
 
         monkeypatch.setattr(dispatcher.reconcile, "kiq", publish)
-        try:
-            await dispatcher.publish_due(sessions)
-        except TimeoutError:
-            pass
+        with pytest.raises(TimeoutError, match="test publication failure"):
+            await dispatcher.publish_one(sessions)
         assert publications == [str(row["payment_id"])]
+        assert await connection.scalar(select(OutboxRow.published_at)) is None
         saved = (await connection.execute(select(AttemptRow))).mappings().one()
         for field in ("check_count", "next_check_at", "reconciliation_deadline", "lease_until"):
             assert saved[field] == row[field]
-        await dispatcher.publish_due(sessions)
+        assert await dispatcher.publish_one(sessions)
+        assert not await dispatcher.publish_one(sessions)
         assert publications == [str(row["payment_id"])] * 2
+        assert await connection.scalar(select(OutboxRow.published_at)) is not None
+
+
+@pytest.mark.parametrize(
+    "changes,ready",
+    [
+        ({"lease_until": 0, "next_check_at": 0}, True),
+        ({"lease_until": 1, "check_count": 3, "next_check_at": 0}, False),
+        ({"check_count": 3, "next_check_at": 60}, True),
+        ({"check_count": 2, "next_check_at": 60}, False),
+        ({"reconciliation_deadline": 0, "next_check_at": None}, True),
+    ],
+)
+async def test_readiness_exact_db_time_and_explicit_limit(changes, ready):
+    from payments.infrastructure.scheduling import reconciliation_ready
+
+    async with isolated_schedule() as (connection, _, now):
+        fields = {"lease_until", "next_check_at", "reconciliation_deadline"}
+        changes = {
+            name: now + timedelta(seconds=value) if name in fields and value is not None else value
+            for name, value in changes.items()
+        }
+        row = scheduled_attempt(now, **changes)
+        await connection.execute(insert(AttemptRow), row)
+        selected = await connection.scalar(
+            select(AttemptRow.id).where(reconciliation_ready(now=now, max_checks=3))
+        )
+        assert (selected == row["id"]) == ready
