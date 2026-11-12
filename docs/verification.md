@@ -414,3 +414,91 @@ live200/ready503; все application containers graceful exit0; restart сохр
 существующий volume и собственную sentinel row (после проверки удалена только она).
 Запуск был после всех pytest/CLI/runtime, без конкурирующих тестов/остановок.
 Новый source не менялся после259/259, пересборка включила исправленный smoke script.
+
+
+## Восстановление из PostgreSQL — 2026-11-12
+
+Фактически выполнено:
+
+```sh
+poetry run alembic upgrade head
+poetry run alembic current
+poetry run alembic upgrade head
+API_URL=http://127.0.0.1:18000 poetry run python scripts/demo.py restart-recovery
+```
+
+Миграция0002 применена; повторный upgrade успешен. D6 завершён exit0,
+10 сценариев. Worker/dispatcher — настоящие локальные процессы Taskiq/Python,
+остановлены SIGKILL и запущены заново; PostgreSQL/Redis/API/mock — Compose.
+PostgreSQL volume сохранён. Redis очищен и пересоздан. API/worker/dispatcher/mock
+перезапущены; mock также перезапускались независимо, при работающем API.
+
+| Сбой / сценарий | payment_id | attempt_id = provider key | ledger A/B |
+|---|---|---|---|
+| commit_before_publish | 47e582a4-f59e-49ec-b169-cacd4d713792 | 328c9409-3561-4753-a3a9-c1df6f740d10 | 1/0 |
+| publish_before_mark | 5b5a3fc0-9570-4be0-8e2a-ded4a6edb6ef | ce5eb709-21f4-48b0-be0c-002ea75011f6 | 1/0 |
+| published_redis_loss | 14b91c03-edb9-4c95-9a78-b0e5d1862dad | 1b7db165-6e5d-4bbf-9e7d-4713e1a1b89b | 1/0 |
+| claim_before_http | 26dd1bba-d7e1-4ef5-9922-c62a614ccdfd | 2181c943-af9f-4fe2-9504-3ed5e9095a0c | 1/0 |
+| claim_before_ack_reclaim | af461cf1-deff-44ed-8cf0-52dc31bdee48 | cb7cccfb-170b-4859-a3ee-fb8e6ca9ef74 | 1/0 |
+| charge_before_result | 0300476e-1e43-4be5-a0a0-87b2b8490983 | f8b6f1e8-9dac-4930-8733-088730213802 | 1/0 |
+| late_owner | ba646b6c-4abf-4fa4-8ee8-5bc72510cca3 | acfeaa03-cb95-4069-9189-de61be23334d | 1/0 |
+| commit_before_ack_reclaim | b9bb357a-3c6e-4165-90d2-f76a1f6dbf4d | 352b1e18-72a5-4818-bee1-75616de09e29 | 1/0 |
+| restart_active_http | b3fdef06-7ea9-4024-8cf7-e620ad65d437 | 7188bb1a-48cb-4b81-9993-14afd86330a2 | 1/0 |
+| fifth_claim_manual_restart | 9e2a4c41-35e6-4c32-99b2-f308143d0c63 | 4b1bf519-f3a8-44e6-8cba-c48252296f4a | 0/0 |
+
+Во всех9 success: A create_calls=1/ledger_amount=123, B create/lookup=0;
+сохранены payment_id, attempt_id/key и safe_retry_until. Для начального pending
+до появления попытки сравнивается исходный payment_id, а созданная попытка затем
+проверяется по GET и БД. Created с уже published событием и сохранение остальных
+полей отдельно проверены в DB-матрице.
+
+Активный lease не изменялся при скане. Для позднего владельца новый lookup
+сохранил канонический финал, после release прежнего ответа snapshot не изменился.
+Два reclaim-сценария запускали новый worker без dispatcher/recovery и новых
+сообщений: PEL исходного stream ID очистился, XRANGE остался побайтно прежним.
+Для незавершённого in_flight после transport reclaim включался DB recovery.
+
+Для пятого claim count4 задан SQL только собственному тестовому платежу;
+настоящий claim5 закоммичен, worker убит, expiry дал version+1/manual/leaseNULL/
+nextNULL. Lookup_calls=0 для этой fixture: claim5 умер перед HTTP, шестого нет.
+После flush/restart manual snapshot и stats неизменны, дубли process/reconcile
+не вызвали HTTP. Полные5 реальных lookup покрывает существующая e2e pytest.
+
+Промежуточные прогоны не считаются успешными: первый controller потерял Redis
+connection после recreate; новый активный HTTP verifier получил422 на release
+без JSON. После исправлений pool disconnect и JSON {} приведённый итоговый D6
+прошёл полностью. Ошибки отражены здесь, а не подменены успешными статусами.
+
+Ограничения: проверки используют договорённый mock key/lookup contract;
+потеря PostgreSQL данных, нагрузка, реальные деньги, exactly-once и SLA не доказаны.
+D6 host-only и меняет состояние Redis данного Compose проекта; не запускать
+параллельно с pytest/другими runtime-скриптами. Все PostgreSQL volumes сохранены.
+
+
+Итоговые проверки шага:
+
+| Проверка | Фактический результат |
+|---|---|
+| RUN_INTEGRATION=1 poetry run pytest -q | 276 passed, 88,30с, без skipped |
+| docker compose run --rm -e RUN_INTEGRATION=1 -e API_URL=http://api:8000 api pytest -q | 276 passed, 89,89с, без skipped |
+| poetry run ruff check . | passed |
+| poetry run ruff format --check . | 66 files already formatted |
+| poetry check; git diff --check | passed |
+| docker compose build; up --force-recreate --wait api worker dispatcher | passed, healthy |
+| alembic current; upgrade head с повтором | 0002 head, passed |
+
+CLI D1–D5 запускались последовательно после pytest, на host через
+API_URL=http://127.0.0.1:18000 poetry run python scripts/demo.py <scenario>.
+Все5 завершились exit0:
+
+| Демо | payment_id | Результат / ledger A,B |
+|---|---|---|
+| first-success | aeb73eec-bd26-4958-9641-0bdde945df1d | succeeded / 1,0 |
+| cascade-success | c599f179-9fbd-4fdf-bdb5-2aa68538a341 | succeeded / 0,1 |
+| all-declined | 6ea678e1-98d8-42ba-bd90-c6b9cf8c9b17 | failed / 0,0 |
+| lost-response | c0c5191a-7ac6-414f-ab02-8ba0e47b5a4e | unknown/null → succeeded / 1,0, lookup1 |
+| duplicate-delivery | 4e55e8b0-50c2-47c0-8907-345a253a9193 | 10 concurrent POST, succeeded / 1,0 |
+
+Все шесть основных демо подтверждены, включая D6 выше. Технические и локальные
+журналы обновлены. Новых нерешённых known issues не обнаружено. Проверки не
+подменяют будущий clean checkout и остальные проверки финальной передачи.

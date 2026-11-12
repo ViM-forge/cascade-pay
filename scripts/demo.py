@@ -11,6 +11,13 @@ from payments.infrastructure.settings import load_settings
 
 
 def run(scenario):
+    if scenario == "restart-recovery":
+        import asyncio
+
+        from check_recovery_runtime import run_recovery
+
+        print(json.dumps(asyncio.run(run_recovery())))
+        return
     if scenario == "duplicate-delivery":
         import asyncio
 
@@ -113,6 +120,7 @@ if __name__ == "__main__":
             "all-declined",
             "duplicate-delivery",
             "lost-response",
+            "restart-recovery",
         ],
     )
     run(parser.parse_args().scenario)

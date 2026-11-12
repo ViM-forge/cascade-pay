@@ -64,6 +64,24 @@ class Payment(BaseModel):
             **(self.model_dump() | dict(status=status, updated_at=now))
         ), next_provider
 
+    def recover_history(self, attempt: "PaymentAttempt", now: datetime) -> tuple[Self, str | None]:
+        """Only persisted canonical terminal history can restore a missing final/cascade."""
+        if self.status != "processing" or attempt.status not in {"succeeded", "declined"}:
+            raise ValueError("history is not recoverable")
+        result = ProviderResult(
+            status="succeeded"
+            if attempt.status == "succeeded"
+            else {
+                "issuer_unavailable": "declined_retryable",
+                "invalid_payment_method": "declined_terminal",
+                "not_charged_final": "not_charged_final",
+            }[attempt.error_code],
+            error_code=attempt.error_code,
+            external_id=attempt.external_id,
+        )
+        status, provider = cascade_decision(self, attempt, result, from_history=True)
+        return type(self)(**(self.model_dump() | dict(status=status, updated_at=now))), provider
+
 
 class PaymentAttempt(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
@@ -132,6 +150,24 @@ class PaymentAttempt(BaseModel):
                     reconciliation_deadline=self.reconciliation_deadline or deadline,
                     next_check_at=self.next_check_at
                     or min(next_check, self.reconciliation_deadline or deadline),
+                )
+            )
+        )
+
+    def expire_in_flight(self, now: datetime, deadline: datetime) -> Self:
+        """Losing an owner means uncertainty, never permission to switch provider."""
+        if self.status != "in_flight" or self.lease_until is None or now < self.lease_until:
+            raise ValueError("claim has not expired")
+        return type(self)(
+            **(
+                self.model_dump()
+                | dict(
+                    status="unknown",
+                    claim_version=self.claim_version + 1,
+                    lease_until=None,
+                    updated_at=now,
+                    reconciliation_deadline=self.reconciliation_deadline or deadline,
+                    next_check_at=self.next_check_at or now,
                 )
             )
         )
@@ -281,12 +317,17 @@ class ProviderResult(BaseModel):
         return "unknown"
 
 
-def cascade_decision(payment: Payment, attempt: PaymentAttempt, result: ProviderResult):
+def cascade_decision(
+    payment: Payment, attempt: PaymentAttempt, result: ProviderResult, *, from_history=False
+):
     """Return payment status and optional next provider from the saved route only."""
-    if (payment.status, attempt.status) not in {
+    allowed = {
         ("processing", "in_flight"),
         ("unknown", "unknown"),
-    }:
+    }
+    if from_history:
+        allowed = {("processing", "succeeded"), ("processing", "declined")}
+    if (payment.status, attempt.status) not in allowed:
         raise ValueError("result requires active payment and attempt")
     if attempt.payment_id != payment.id:
         raise ValueError("attempt belongs to another payment")

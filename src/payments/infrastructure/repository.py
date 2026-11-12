@@ -1,7 +1,8 @@
+import logging
 from datetime import timedelta
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
 from payments.application.ports import Conflict
@@ -126,13 +127,121 @@ class PaymentRepository:
         )
         return payment, attempt
 
+    async def recover_batch(self, batch=20):
+        """DB-only scheduling. Lock payments before attempts, as all worker paths do."""
+        now = await self.session.scalar(select(func.clock_timestamp()))
+        active = (
+            select(AttemptRow.id)
+            .where(
+                AttemptRow.payment_id == PaymentRow.id,
+                AttemptRow.status.in_(["created", "in_flight", "unknown"]),
+            )
+            .exists()
+        )
+        ready = (
+            select(AttemptRow.id)
+            .where(
+                AttemptRow.payment_id == PaymentRow.id,
+                or_(
+                    AttemptRow.status == "created",
+                    and_(AttemptRow.status == "in_flight", AttemptRow.lease_until <= now),
+                    and_(
+                        AttemptRow.status == "unknown",
+                        AttemptRow.manual_review_required.is_(False),
+                        or_(AttemptRow.lease_until.is_(None), AttemptRow.lease_until <= now),
+                        or_(
+                            AttemptRow.next_check_at <= now,
+                            AttemptRow.check_count >= self.settings.reconciliation_max_checks,
+                            AttemptRow.reconciliation_deadline <= now,
+                        ),
+                    ),
+                ),
+            )
+            .exists()
+        )
+        rows = (
+            await self.session.scalars(
+                select(PaymentRow)
+                .where(
+                    PaymentRow.status.in_(["pending", "processing", "unknown"]),
+                    PaymentRow.updated_at
+                    <= now - timedelta(seconds=self.settings.recovery_interval_seconds),
+                    or_(ready, and_(PaymentRow.status.in_(["pending", "processing"]), ~active)),
+                )
+                .order_by(PaymentRow.updated_at, PaymentRow.id)
+                .limit(batch)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+        for p in rows:
+            _, a = await self.locked(p.id)
+            if a is None:
+                await self.prepare(p.id)
+            elif a.status in {"succeeded", "declined"}:
+                # Repair only from durable history, using the same result policy.
+                payment, next_provider = payment_entity(p).recover_history(attempt_entity(a), now)
+                await self.save_payment_result(p, a, payment, next_provider, now)
+            elif a.status == "in_flight":
+                store_attempt(
+                    a,
+                    attempt_entity(a).expire_in_flight(
+                        now, now + timedelta(seconds=self.settings.reconciliation_deadline_seconds)
+                    ),
+                )
+                entity = payment_entity(p).transition("unknown", now)
+                p.status = entity.status
+            # Re-read after prepare/repair, preserving the immutable saved identity.
+            await self.session.flush()
+            _, a = await self.locked(p.id)
+            event = None
+            if a.status == "created":
+                event = "process_payment"
+            elif a.status == "unknown":
+                action = attempt_entity(a).reconciliation_action(
+                    now, self.settings.reconciliation_max_checks
+                )
+                if action == "manual":
+                    store_attempt(
+                        a,
+                        attempt_entity(a).stop_reconciliation(
+                            now, self.settings.reconciliation_max_checks
+                        ),
+                    )
+                elif action == "claim":
+                    event = "reconcile_payment"
+            if event:
+                unpublished = await self.session.scalar(
+                    select(OutboxRow.id)
+                    .where(
+                        OutboxRow.payment_id == p.id,
+                        OutboxRow.event_type == event,
+                        OutboxRow.published_at.is_(None),
+                    )
+                    .limit(1)
+                )
+                if unpublished is None:
+                    self.enqueue(event, p.id, now)
+            logging.info(
+                "recovery scheduled",
+                extra=dict(
+                    event="recovery_scheduled",
+                    payment_id=str(p.id),
+                    attempt_id=str(a.id),
+                    result="manual" if a.manual_review_required else event or a.status,
+                ),
+            )
+            p.updated_at = now  # Fair rotation and bounded republication frequency.
+        return len(rows)
+
     async def prepare(self, identity):
         p, a = await self.locked(identity)
         if p is None or p.status in {"succeeded", "failed"}:
             return None
         now = await self.session.scalar(select(func.clock_timestamp()))
         if a is None:
-            entity = payment_entity(p).transition("processing", now)
+            entity = payment_entity(p)
+            if entity.status != "processing":
+                entity = entity.transition("processing", now)
             p.status, p.updated_at = entity.status, now
             key = uuid4()
             a = AttemptRow(
@@ -158,7 +267,7 @@ class PaymentRepository:
         now = await self.session.scalar(select(func.clock_timestamp()))
         if a.status != "created":
             # No HTTP for terminal, active lease or unknown/expired in-flight.
-            # Recovery/reconciliation will be introduced separately.
+            # Recovery schedules lookup after lease expiry.
             return None
         if now >= a.safe_retry_until:
             # The time is read after both locks. A late initial delivery must
@@ -236,6 +345,12 @@ class PaymentRepository:
         store_attempt(a, finished)
         # Flush the terminal A before inserting B: partial UNIQUE forbids two active attempts.
         await self.session.flush()
+        await self.save_payment_result(p, a, payment, next_provider, now)
+        if finished.status == "unknown" and not finished.manual_review_required:
+            self.enqueue("reconcile_payment", p.id, now)
+        return True
+
+    async def save_payment_result(self, p, a, payment, next_provider, now):
         if next_provider:
             key = uuid4()
             self.session.add(
@@ -253,10 +368,7 @@ class PaymentRepository:
                 )
             )
             self.enqueue("process_payment", p.id, now)
-        if finished.status == "unknown" and not finished.manual_review_required:
-            self.enqueue("reconcile_payment", p.id, now)
         p.status, p.updated_at = payment.status, now
-        return True
 
 
 class SqlUoW:

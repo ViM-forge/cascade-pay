@@ -1,16 +1,19 @@
 import asyncio
 import logging
 import signal
+import time
 
 from sqlalchemy import and_, func, or_, select, update
 
 from payments.infrastructure.db import create_engine, session_factory
+from payments.infrastructure.fault_control import barrier
 from payments.infrastructure.orm import AttemptRow, OutboxRow
+from payments.infrastructure.repository import PaymentRepository
 from payments.infrastructure.worker import broker, process, reconcile, settings
 
 
 def reconciliation_ready():
-    """Only bounded unknown work, never general in-flight recovery (step 7)."""
+    """Outbox reconciliation readiness; domain claim remains authoritative."""
     now = func.clock_timestamp()
     return and_(
         AttemptRow.status == "unknown",
@@ -48,9 +51,11 @@ async def publish_one(sessions):
         if row is None:
             return False
         identity, payment_id, event_type = row.id, row.payment_id, row.event_type
+    await barrier("before_publish", str(payment_id))
     async with asyncio.timeout(settings.http_timeout_seconds):
         task = process if event_type == "process_payment" else reconcile
         await task.kiq(str(payment_id))
+    await barrier("after_publish", str(payment_id))
     async with sessions.begin() as session:
         await session.execute(
             update(OutboxRow)
@@ -86,11 +91,17 @@ async def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stopped.set)
     await broker.startup()
+    last_recovery = 0.0
     try:
         while not stopped.is_set():
             try:
+                if time.monotonic() - last_recovery >= settings.recovery_interval_seconds:
+                    async with sessions.begin() as session:
+                        count = await PaymentRepository(session, settings).recover_batch()
+                    last_recovery = time.monotonic()
+                    if count:
+                        logging.info("recovery scan", extra={"event": "recovery_scan"})
                 await publish_one(sessions)
-                await publish_due(sessions)
             except Exception:
                 logging.warning("publish retry", extra={"event": "publish_retry"})
             try:

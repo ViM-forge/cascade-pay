@@ -3,7 +3,7 @@
 Последовательный каскад: POST → PostgreSQL/outbox → Redis/Taskiq → worker →
 HTTP mock A/B → GET с историей попыток. Доступны JWT, конкурентная идемпотентность,
 устойчивые отказы, независимые ledger mock A/B и ограниченная сверка unknown.
-Общий DB recovery ещё не реализован. Реальные деньги не используются.
+Восстановление незавершённой обработки идёт из PostgreSQL. Реальные деньги не используются.
 
 Нужны Docker Desktop/Engine с Compose v2. Для локальной разработки — Python 3.13
 и Poetry **2.2.1** (для установки командой ниже нужен uv). В Docker: Python 3.13.9, PostgreSQL 17.6, Redis 7.4.6.
@@ -63,7 +63,7 @@ taskiq-redis 1.2.4 независимо каждые 2 с возвращает p
 поэтому адаптер нужен даже при manual ACK. При обновлении taskiq-redis пересмотрите
 адаптер и повторите тест без новых публикаций.
 Redis — транспорт, PostgreSQL — источник истины. Worker подтверждает сообщение только после commit результата или проверенного no-op.
-Потеря Redis не компенсируется на этом этапе: DB recovery ещё не реализован.
+После потери Redis dispatcher повторно планирует незавершённую работу из PostgreSQL.
 
 ## Локальная разработка и проверки
 
@@ -149,8 +149,7 @@ poetry run python scripts/check_first_payment_runtime.py
 Runtime-проверка подтверждает сохранность операции/ledger после restart, unknown
 при недоступном A без вызова B, 404 controls вне demo/test и отсутствие проверяемых
 секретов/ref в логах. Для Docker pytest задайте API_URL=http://api:8000.
-Unknown автоматически сверяется по сохранённому provider key. Восстановления
-expired in_flight и потери Redis пока нет. Поздний ответ после lease не сохраняется. Эти ограничения не дают
+Unknown автоматически сверяется по сохранённому provider key. Expired in_flight переводится в сверку; потерянные доставки восстанавливаются из БД. Поздний ответ после lease не сохраняется. Эти ограничения не дают
 основания повторять платёж с новым клиентским ключом.
 
 
@@ -272,9 +271,7 @@ unknown. Действующий владелец пятой проверки м�
 
 Dispatcher выбирает due unknown без действующего lease, включая исчерпанные
 независимо от due. Публикация имеет timeout; publish-before-mark сохранён.
-При сбое событие/due остаётся доступно следующему проходу. Это только сверка
-unknown; общий scan pending/created/expired in_flight и Redis-loss recovery
-остаются будущим объёмом. Taskiq manual ACK — после commit либо проверенного
+При сбое событие/due остаётся доступно следующему проходу. Общий recovery также находит pending/created/expired in_flight после потери Redis. Taskiq manual ACK — после commit либо проверенного
 no-op. Независимый periodic reclaim сохранён.
 
 Ручной разбор: собрать payment/attempt/provider/key из защищённого хранилища,
@@ -283,3 +280,59 @@ no-op. Независимый periodic reclaim сохранён.
 ключом: это создаст другое намерение списания. Время ожидания не доказывает отказ.
 Финансового endpoint ручного разрешения нет; manual marker сам не снимается.
 HTTP calls считают обращения, ledger считает списания — эти числа различаются.
+
+
+## Восстановление и D6
+
+Dispatcher раз в RECOVERY_INTERVAL_SECONDS (по умолчанию 2с) выбирает максимум
+20 незавершённых платежей из PostgreSQL. Row locks с SKIP LOCKED позволяют
+конкурентным сканам пропускать уже занятые платежи. Это простой polling,
+без обещанного SLA: очередь и backlog влияют на время завершения.
+
+Pending без попытки получает A. Created получает повторную задачу даже при
+published_at у прежнего события. Expired in_flight получает unknown, новую
+version и lookup прежнего key: ни возраст платежа, ни таймаут не разрешают B.
+Processing без активной попытки восстанавливается по сохранённой истории;
+только подтверждённый разрешённый отказ создаёт B.
+
+Активный lease не меняется. Исчерпанные count/deadline после expiry дают manual
+до due-времени, без шестого HTTP. Manual marker, budget, deadline и сохранённое
+окно safe_retry_until не сбрасываются. Версия владельца и lease отсекают поздний
+ответ. Изменение состояния и новое outbox-событие фиксируются одной транзакцией.
+Повторное unpublished событие не добавляется; published событие можно заменить
+новым сигналом для того же платежа. Publisher сначала отправляет, затем отмечает
+published_at, с сетевым timeout. Ошибка оставляет событие; crash после отправки
+допускает безопасный дубль. Exactly-once доставки нет.
+
+D6 запускается **на хосте**, отдельно от pytest и других runtime-скриптов:
+
+```sh
+API_URL=http://127.0.0.1:18000 poetry run python scripts/demo.py restart-recovery
+# та же полная матрица напрямую:
+poetry run python scripts/check_recovery_runtime.py
+```
+
+Нужны Docker Compose и локальные зависимости Poetry; .env указывает на host
+порты БД/Redis/mock, mock запущены с APP_PROFILE=demo/test. Скрипт останавливает
+Compose worker/dispatcher, запускает настоящие локальные Taskiq/dispatcher,
+убивает их группы процессов SIGKILL в известных точках, пересоздаёт Redis,
+перезапускает API и mock. PostgreSQL volume не удаляется. В конце worker и
+dispatcher Compose запускаются снова. Redis данного проекта очищается; выполняйте
+проверку в выделенном демонстрационном окружении.
+
+Матрица проверяет payment/attempt/key, GET после restart и независимые ledger,
+crash после списания до result commit, активный lease, поздний ответ, пятый claim,
+manual после restart и periodic reclaim исходного stream ID без recovery и новых
+публикаций до и после result commit. В случае reclaim незавершённого in_flight
+transport ACK no-op не заменяет последующий DB recovery.
+
+Barriers недоступны через API: необходимы одновременно APP_PROFILE=test,
+TEST_BARRIER_DIR и локальный файл <point>.<payment UUID>.arm. Достижение создаёт
+.reached; удаление .arm освобождает только первого достигшего владельца.
+Точки: before_payment_commit, after_payment_commit, after_prepare, after_claim,
+before_result_commit, after_result_commit, before_publish, after_publish.
+По умолчанию механизм выключен. Before_payment_commit намеренно удерживает
+тестовую транзакцию; HTTP-провайдер вызывается только после commit claim.
+
+Гарантия требует сохранённых PostgreSQL-данных и контракта устойчивого key/lookup
+провайдера. Потеря PostgreSQL volume, реальные деньги и нагрузочный SLA не покрыты.

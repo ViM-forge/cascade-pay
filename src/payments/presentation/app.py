@@ -13,6 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from payments.application.ports import Conflict
 from payments.application.use_cases import create_payment, get_payment
 from payments.infrastructure.db import create_engine, session_factory
+from payments.infrastructure.fault_control import barrier
 from payments.infrastructure.logging import configure_logging
 from payments.infrastructure.repository import SqlUoW
 from payments.infrastructure.settings import load_settings
@@ -98,6 +99,7 @@ async def create(
             body.amount_minor,
             body.currency,
             body.payment_method_ref,
+            checkpoint=barrier,
         )
     except Conflict:
         return error("idempotency_conflict", 409)

@@ -193,3 +193,27 @@ D5 реализован; этот исторический результат н
 lookup adapter тестов в tests/unit. Результаты запусков и ограничения —
 verification.md. Полная комбинированная fault-matrix/D6/Redis-loss recovery не
 объявляются выполненными этим этапом.
+
+## Восстановление PostgreSQL / D6
+
+`tests/integration/test_recovery.py` проверяет реальный SQL на изолированных
+временных таблицах: pending, orphan processing, created с published событием,
+expired/live in_flight, due unknown, manual, исчерпанный бюджет независимо от due,
+неизменные key/window/count/deadline, атомарные события и ограниченный batch.
+История success/terminal/разрешённых отказов использует общую политику каскада.
+`tests/unit/test_recovery_policy.py` проверяет точную границу expiry и выключенные
+по умолчанию barriers.
+
+`scripts/demo.py restart-recovery` (host-only, отдельно от pytest) запускает
+`scripts/check_recovery_runtime.py`. Реальные локальные Taskiq/dispatcher получают
+SIGKILL в известных точках; PostgreSQL/Redis/API/mock — настоящие зависимости.
+Проверяются commit→publish, publish→mark, published→Redis flush/recreate,
+claim→HTTP, charge→result commit, активный HTTP во время restart, поздний ответ,
+исходный stream ID при periodic reclaim без recovery/новых сообщений до и после
+result commit. Для пятого claim подготовительный SQL задаёт count4 собственного
+платежа: затем настоящий claim5 commit, crash, expiry→manual без lookup6.
+Полные5 фактических HTTP-проверок отдельно покрывает test_budget_manual_no_sixth_lookup.
+Manual сохраняется после restart API/worker/dispatcher/mock и flush Redis;
+успешный ledger/GET сохраняются при независимом restart каждого mock.
+Сравниваются payment_id, attempt_id, provider key, safe_retry_until и независимые
+ledger/calls, а не только конечный статус. Точные запуски — в verification.md.

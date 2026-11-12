@@ -1,6 +1,6 @@
 # Контракты и решения MVP
 
-Статус: контракты приняты; окружение, health и базовая миграция реализованы и проверены — [проверки окружения](verification.md). Success через A и последовательный каскад после подтверждённых разрешённых отказов реализованы; проверки и ограничения — в verification.md. Ограниченная сверка unknown реализована; общий DB recovery ещё не реализован. Нормативный контракт провайдеров: [provider-contract.md](provider-contract.md), критерии будущей проверки: [acceptance.md](acceptance.md).
+Статус: контракты приняты; окружение, health и базовая миграция реализованы и проверены — [проверки окружения](verification.md). Success через A и последовательный каскад после подтверждённых разрешённых отказов реализованы; проверки и ограничения — в verification.md. Ограниченная сверка unknown реализована; общий DB recovery реализован; фактические проверки — в verification.md. Нормативный контракт провайдеров: [provider-contract.md](provider-contract.md), критерии будущей проверки: [acceptance.md](acceptance.md).
 
 ## Объём и архитектура
 
@@ -165,3 +165,28 @@ Wall-clock HTTP/публикация ограничены asyncio.timeout, а н
 Каждый UoW открывает отдельную async-сессию; не разделяем mutable session между
 задачами ([SQLAlchemy 2.0](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html#using-asyncsession-with-concurrent-tasks)).
 Зависимости не обновлялись; гарантии подтверждаются тестами, а не выбором библиотеки.
+
+
+## Реализация восстановления
+
+Recovery — DB-only транзакция до попытки публикации, batch=20, порядок блокировок
+payment → attempt, конкурирующие сканы используют SKIP LOCKED. Период задаётся
+RECOVERY_INTERVAL_SECONDS. Повторное планирование обновляет updated_at платежа
+для ротации backlog; время попытки, безопасное окно и лимиты не обновляются.
+Отдельного distributed lock в Redis для DB recovery нет.
+Миграция 0002 добавляет partial indexes created и budget unknown; status/update,
+lease, due, unpublished и уникальность active существовали в 0001.
+
+Правила expiry/history находятся в domain, SQL и outbox — в repository;
+application получает необязательный checkpoint callback, без зависимости от
+файловой системы. Адаптер включает barriers только при явном test окружении.
+Сохранение следующей попытки использует тот же helper, что обычный finish:
+нет отдельной копии каскадной политики для recovery.
+
+SKIP LOCKED предназначен в том числе для очередеподобных выборок, но не даёт
+согласованного общего снимка ([PostgreSQL17 SELECT](https://www.postgresql.org/docs/17/sql-select.html)).
+XAUTOCLAIM меняет владельца pending сообщений; это не восстановление удалённых
+сообщений ([Redis](https://redis.io/docs/latest/commands/xautoclaim/)).
+Общий timeout публикации ограничивает всё ожидание
+([Python3.13](https://docs.python.org/3.13/library/asyncio-task.html#asyncio.timeout)).
+Зависимости не обновлялись; тесты не являются измерением пропускной способности.

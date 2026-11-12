@@ -6,6 +6,7 @@ from taskiq import Context, TaskiqDepends, TaskiqEvents
 
 from payments.application.use_cases import process_payment, reconcile_payment
 from payments.infrastructure.db import create_engine, session_factory
+from payments.infrastructure.fault_control import barrier
 from payments.infrastructure.http_provider import HttpProvider
 from payments.infrastructure.logging import configure_logging
 from payments.infrastructure.repository import SqlUoW
@@ -45,7 +46,10 @@ async def shutdown(state):
 async def process(payment_id: str, context: Context = TaskiqDepends()):  # noqa: B008
     started = time.monotonic()
     result, attempt_id, provider = await process_payment(
-        SqlUoW(context.state.sessions, settings), HttpProvider(settings), UUID(payment_id)
+        SqlUoW(context.state.sessions, settings),
+        HttpProvider(settings),
+        UUID(payment_id),
+        checkpoint=barrier,
     )
     logging.info(
         "payment processed",
@@ -66,7 +70,10 @@ async def process(payment_id: str, context: Context = TaskiqDepends()):  # noqa:
 async def reconcile(payment_id: str, context: Context = TaskiqDepends()):  # noqa: B008
     started = time.monotonic()
     result, attempt_id, provider = await reconcile_payment(
-        SqlUoW(context.state.sessions, settings), HttpProvider(settings), UUID(payment_id)
+        SqlUoW(context.state.sessions, settings),
+        HttpProvider(settings),
+        UUID(payment_id),
+        checkpoint=barrier,
     )
     logging.info(
         "payment reconciled",
