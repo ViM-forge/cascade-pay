@@ -138,3 +138,72 @@ runtime script также прошёл: устойчивые отказы пос
 новый коммит агентом не создавался.
 
 Итоговый Docker pytest с RUN_INTEGRATION=1: **101 passed, 0 skipped**.
+
+## Новые проверки: идемпотентность и конкуренция — 2026-11-12
+
+Это новые запуски на рабочем дереве поверх существующего пользовательского
+коммита `5d26b43`; исторические 101 тест выше не подменяют текущие результаты.
+На старте Git чистый, семь сервисов `cascade-bootstrap-check` healthy, API 18000.
+Порт 8000 по-прежнему занят чужим Python-процессом; он не останавливался.
+Volumes `cascade-bootstrap-check_postgres-data` и `cascade-payments_postgres-data`
+сохранены. Исключённый .env, .gitignore, зависимости и poetry.lock не менялись.
+
+Установленные версии проверены importlib.metadata: SQLAlchemy 2.0.57,
+asyncpg 0.32.0, Taskiq 0.13.0, taskiq-redis 1.2.4, httpx 0.28.1,
+Pydantic 2.14.3, Alembic 1.20.1. Новый mock schema revision — mock_0003;
+payments schema по-прежнему достаточна (0001).
+
+| Фактически выполненная проверка | Результат |
+|---|---|
+| `poetry check`, `ruff check .`, `ruff format --check .` | Успех |
+| `docker compose config -q`, build и up --wait пяти application services | Успех |
+| `compose run --rm migrate`, `migrate-mock-a`, `migrate-mock-b`, каждая дважды | Успех; реальные revision SELECT: 0001/mock_0003/mock_0003 |
+| `RUN_INTEGRATION=1 poetry run pytest -q` | **123 passed, 0 skipped**; последний повтор после уточнения ACK: 21.03 с |
+| `compose run --rm -e RUN_INTEGRATION=1 -e API_URL=http://api:8000 api pytest -q` | **123 passed, 0 skipped**; последний повтор: 23.43 с |
+| 10 конкурентных одинаковых POST | Все 202, один UUID, одна payment/attempt/outbox |
+| 10 конкурентных POST с двумя payload | Победившие данные 202/один UUID, остальные 409; нормализованный terminal repeat совпадает |
+| Same key у двух merchant | Разные платежи; чужой GET остаётся 404 |
+| Fake equal hash, разные поля | 409; hash не заменяет поля |
+| D5 на before_charge_commit и after_charge_commit_before_response | Настоящий HTTP/Taskiq, ACK дубля при открытом исходном HTTP; после release одна A, calls=1, ledger=1/123, B=0 |
+| Stale worker HTTP result: другой version или истёкший lease | После доставки/ACK платёж не изменён ответом, external_id не сохранён, provider ledger=1/345, одна attempt |
+| DB finish с чужим UUID, version, expired lease | False/no-op; без ложного финала |
+| DB lock wait | Через pg_blocking_pids наблюдено ожидание payment lock; lease истёк до получения lock, ответ не сохранён |
+| Повтор результата A → B, затем старые результаты после terminal B | Две attempt/outbox, terminal succeeded не перезаписан |
+| Direct concurrent HTTP к mock A и B: success и три отказа | На каждый сценарий 10 конфликтующих + 10 одинаковых запросов; одна canonical operation, 20 create_calls, 1 lookup; ledger=1 только для success, отказы=0 |
+| Credentials barrier | Нет credential/credential другого provider →401 |
+| `check_idempotency_runtime.py` | Три задачи до первого HTTP; ещё дубли при открытом B; разные PID 8/9 (ранее 6/7 и 7/8); calls A/B=1/1, ledger=0/1; после доставки две attempt/outbox |
+| Тот же runtime: конкурентный direct charge и restart mock A | 10 одинаковых HTTP, затем restart и повтор: прежний canonical external_id, create_calls=11, ledger=1/567 |
+| `check_first_payment_runtime.py` | Success и все отказы после restart неизменны; unknown/not_found без B; production controls, включая barrier GET/release, →404; safe logs |
+| `check_bootstrap.py --api-port 18000` | CONNECT isolation, два HTTP worker, live=200/ready=503 при недоступности Redis/PostgreSQL; graceful exit 0; строка/volumes сохранены после restart |
+| CLI `first-success` | exit 0; A succeeded, ledger=1/0, сумма=123 |
+| CLI `cascade-success` | exit 0; A declined/B succeeded, ledger=0/1, сумма=123 |
+| CLI `all-declined` | exit 0; failed, две declined, ledger=0/0 |
+| CLI `duplicate-delivery` | exit 0; 10 concurrent POST →один UUID, Taskiq no-op ACK при barrier; terminal repeat, calls=1/0 и ledger=1/0 |
+| `git diff --check` | Успех; commit/amend/push/staging не выполнялись |
+
+Применённые миграции не переписывались. Два Taskiq worker-процесса создают
+собственные engine/pool в startup, имеют по одной активной async-задаче; API
+остаётся под Gunicorn/uvicorn-worker без preload. HTTP выполняется вне DB
+транзакции, lock payment → attempt, manual ACK после commit/no-op,
+publish-before-mark, bounded HTTP timeout и periodic reclaim сохранены.
+Regression включает исключение до commit без ACK, JWT/строгий ввод/безопасные
+ответы, transport reclaim без нового трафика и предыдущие D1–D3.
+
+Промежуточные ошибки не скрываются: первый запуск дал 109 passed и два failed
+из-за подготовки новых DB-тестов (raw lease UPDATE до flush claim и UUID без
+соответствующего provider key). Исправлена подготовка, рабочий механизм не
+переписывался. Runtime сначала пережидал HTTP timeout при ожидании health,
+затем ждал дубль, попавший в очередь занятого worker. Исправлено наблюдение
+barrier и ожидание ACK любого нового дубля; после release проверяются все.
+Неудачные прогоны оставили unknown с реальным ledger — они не названы успехом
+или отказом. В одном промежуточном прогоне pytest начат до финального результата
+runtime; итоговые runtime, CLI и pytest выполнены последовательно.
+
+Границы доказанного: финансовые assertions читают независимый provider ledger
+через HTTP. Дополнительные DB-тесты с принудительным lease/version и откатом
+не являются financial recovery. Изменение уровня изоляции требует пересмотра
+ON CONFLICT/SELECT протокола. Provider idempotency не заменяет владение worker.
+Автоматическая сверка unknown, DB recovery, D4/D6, полная fault-matrix, нагрузка,
+реальный provider и финальная проверка чистого checkout не реализованы и не
+объявлены пройденными. Это согласованные границы последующих этапов.
+Актуальных подтверждённых нерешённых проблем не выявлено — [known issues](known-issues.md).

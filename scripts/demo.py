@@ -11,6 +11,13 @@ from payments.infrastructure.settings import load_settings
 
 
 def run(scenario):
+    if scenario == "duplicate-delivery":
+        import asyncio
+
+        from duplicate_delivery import run_duplicate
+
+        print(json.dumps(asyncio.run(run_duplicate())))
+        return
     settings = load_settings()
     modes = {
         "first-success": ("success", "success"),
@@ -91,5 +98,8 @@ def run(scenario):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("scenario", choices=["first-success", "cascade-success", "all-declined"])
+    parser.add_argument(
+        "scenario",
+        choices=["first-success", "cascade-success", "all-declined", "duplicate-delivery"],
+    )
     run(parser.parse_args().scenario)

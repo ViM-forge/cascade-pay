@@ -104,3 +104,16 @@ def test_identity_not_mutable_snapshot_equality():
     assert p == changed and hash(p) == hash(changed)
     with pytest.raises(ValidationError):
         Payment(**(p.model_dump() | {"routing_snapshot": ("B", "A")}))
+
+
+def test_canonical_hash_unicode_and_boundaries():
+    import hashlib
+
+    from payments.domain.models import request_hash
+
+    canonical = '{"amount_minor":9223372036854775807,"currency":"USD","payment_method_ref":"é"}'
+    assert (
+        request_hash(9223372036854775807, "USD", "é")
+        == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    )
+    assert request_hash(1, "USD", "é") != request_hash(1, "USD", "e\u0301")

@@ -47,12 +47,18 @@ class PaymentRepository:
                 )
             )
             return payment
+        # READ COMMITTED: DO NOTHING may wait for a concurrent winner. The next
+        # statement gets a fresh snapshot; no failed INSERT/aborted transaction.
         row = await self.session.scalar(
             select(PaymentRow).where(
                 PaymentRow.merchant_id == payment.merchant_id, PaymentRow.idempotency_key == key
             )
         )
-        if (row.amount_minor, row.currency, row.payment_method_ref) != (
+        if row.request_hash != values["request_hash"] or (
+            row.amount_minor,
+            row.currency,
+            row.payment_method_ref,
+        ) != (
             payment.amount_minor,
             payment.currency,
             payment.payment_method_ref,

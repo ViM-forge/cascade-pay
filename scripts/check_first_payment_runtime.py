@@ -148,12 +148,18 @@ def main():
             for verb, path in [
                 ("GET", "/__test/stats?method_ref=demo"),
                 ("PUT", "/__test/fixtures/demo"),
+                ("GET", "/__test/barriers/" + str(uuid4())),
+                ("POST", "/__test/barriers/" + str(uuid4()) + "/release"),
             ]:
                 r = c.request(
                     verb,
                     "http://127.0.0.1:18001" + path,
                     headers=pa,
-                    json={"charge_mode": "success"} if verb == "PUT" else None,
+                    json={"charge_mode": "success"}
+                    if verb == "PUT"
+                    else {}
+                    if verb == "POST"
+                    else None,
                 )
                 assert r.status_code == 404
         finally:

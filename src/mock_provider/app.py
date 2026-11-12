@@ -1,3 +1,4 @@
+import asyncio
 import secrets
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -82,7 +83,7 @@ class Fixture(BaseModel):
     charge_mode: Literal["success", "declined_retryable", "declined_terminal", "not_charged_final"]
     lookup_mode: Literal["normal"] = "normal"
     lookup_not_found_count: Literal[0] = 0
-    barrier: None = None
+    barrier: Literal["before_charge_commit", "after_charge_commit_before_response"] | None = None
 
 
 def envelope(row):
@@ -112,7 +113,18 @@ async def charge(body: Charge, request: Request):
         external_id=uuid4(),
         request_hash=request_hash(body.amount_minor, body.currency, body.method_ref),
     )
-    async with request.app.state.engine.begin() as c:
+    engine = request.app.state.engine
+    async with engine.connect() as c:
+        point = (
+            await c.scalar(
+                text("SELECT barrier FROM fixtures WHERE method_ref=:method_ref"), values
+            )
+            if request.app.state.settings.app_profile in {"test", "demo"}
+            else None
+        )
+    if point == "before_charge_commit":
+        await wait_barrier(engine, body.key, point)
+    async with engine.begin() as c:
         await c.execute(
             text("INSERT INTO calls(key, method_ref, kind) VALUES(:key,:method_ref,'create')"),
             values,
@@ -150,11 +162,17 @@ async def charge(body: Charge, request: Request):
             .mappings()
             .one()
         )
-        conflict = (row["amount_minor"], row["currency"], row["method_ref"]) != (
+        conflict = row["request_hash"] != values["request_hash"] or (
+            row["amount_minor"],
+            row["currency"],
+            row["method_ref"],
+        ) != (
             body.amount_minor,
             body.currency,
             body.method_ref,
         )
+    if point == "after_charge_commit_before_response":
+        await wait_barrier(engine, body.key, point)
     return error("idempotency_conflict", 409) if conflict else envelope(row)
 
 
@@ -185,9 +203,11 @@ async def fixture(method_ref: str, body: Fixture, request: Request):
         return error("validation_error", 422, fields=["method_ref"])
     async with request.app.state.engine.begin() as c:
         await c.execute(
-            text("""INSERT INTO fixtures VALUES(:ref,:mode)
-            ON CONFLICT(method_ref) DO UPDATE SET charge_mode=excluded.charge_mode"""),
-            {"ref": method_ref, "mode": body.charge_mode},
+            text("""INSERT INTO fixtures(method_ref,charge_mode,barrier)
+            VALUES(:ref,:mode,:barrier)
+            ON CONFLICT(method_ref) DO UPDATE SET charge_mode=excluded.charge_mode,
+            barrier=excluded.barrier"""),
+            {"ref": method_ref, "mode": body.charge_mode, "barrier": body.barrier},
         )
     return body.model_dump()
 
@@ -241,3 +261,53 @@ async def stats(request: Request, key: UUID | None = None, method_ref: str | Non
         lookup_calls=counts.get("lookup", 0),
         operations=[{k: str(r[k]) for k in ["key", "external_id", "status"]} for r in rows],
     )
+
+
+async def wait_barrier(engine, key, point):
+    """Persist reached before waiting; never hold a DB transaction during the wait.
+
+    before_charge_commit gates entry into the atomic charge transaction. Timeout
+    releases only the HTTP handler, never changes the operation or ledger.
+    """
+    async with engine.begin() as c:
+        await c.execute(
+            text("""INSERT INTO barriers(key,point) VALUES(:key,:point)
+            ON CONFLICT(key) DO NOTHING"""),
+            {"key": key, "point": point},
+        )
+    async with asyncio.timeout(30):
+        while True:
+            async with engine.connect() as c:
+                released = await c.scalar(
+                    text("SELECT released FROM barriers WHERE key=:key"), {"key": key}
+                )
+            if released:
+                return
+            await asyncio.sleep(0.01)
+
+
+@app.get("/__test/barriers/{key}", dependencies=[Depends(controls)])
+async def barrier_state(key: UUID, request: Request):
+    async with request.app.state.engine.connect() as c:
+        row = (
+            (await c.execute(text("SELECT * FROM barriers WHERE key=:key"), {"key": key}))
+            .mappings()
+            .one_or_none()
+        )
+    return dict(
+        key=str(key),
+        point=row["point"] if row else None,
+        reached=row is not None,
+        released=row["released"] if row else False,
+    )
+
+
+class Release(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+@app.post("/__test/barriers/{key}/release", dependencies=[Depends(controls)])
+async def release_barrier(key: UUID, body: Release, request: Request):
+    async with request.app.state.engine.begin() as c:
+        await c.execute(text("UPDATE barriers SET released=true WHERE key=:key"), {"key": key})
+    return await barrier_state(key, request)

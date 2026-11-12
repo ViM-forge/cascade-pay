@@ -64,7 +64,7 @@ services:
       retries: 20
   worker:
     <<: *app
-    command: ["taskiq", "worker", "payments.infrastructure.worker:broker", "--workers", "1", "--ack-type", "manual", "--shutdown-timeout", "10"]
+    command: ["taskiq", "worker", "payments.infrastructure.worker:broker", "--workers", "2", "--max-async-tasks", "1", "--ack-type", "manual", "--shutdown-timeout", "10"]
     healthcheck:
       test: ["CMD", "python", "-m", "payments.infrastructure.worker_health"]
       interval: 5s

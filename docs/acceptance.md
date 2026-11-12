@@ -111,3 +111,29 @@ sequence/UUID/key, число outbox, история GET, повтор терм�
 Граница snapshot согласована: маршрут остаётся фиксированным A → B, изменяемая
 настройка не добавлена. Проверяются сохранённый JSONB snapshot, round-trip
 доменной модели, запрет изменения и выбор следующего provider из snapshot.
+
+
+## Проверка конкурентной идемпотентности
+
+- `test_idempotency.py::test_client_race`: 10 POST, одинаковые/конфликтующие данные,
+  нормализация USD, terminal repeat, merchant scope, одна payment/attempt/outbox,
+  фактический READ COMMITTED.
+- `test_idempotency.py::test_direct_mock_race`: оба независимых mock, success и все
+  три финальных отказа; 10 конфликтующих + 10 одинаковых HTTP, canonical external_id,
+  одна operation, ledger отдельно от create_calls/lookup_calls.
+- `test_concurrency.py::test_d5_http_taskiq`: CLI D5 через настоящий HTTP/Taskiq на
+  обеих barrier-точках, ACK дубля до освобождения исходного запроса, вызовы/ledger.
+- `test_http_worker_rejects_stale_result`: принудительная смена version/expiry lease
+  во время настоящего HTTP; после ACK устаревший ответ не сохранён, ledger=1.
+- `test_repository_fencing`, `test_lease_checked_after_waiting_for_payment_lock`,
+  `test_duplicate_cascade_result_transaction`, `test_fields_are_compared_even_when_hash_equal`:
+  дополнительные DB-тесты владельца/времени после lock, повторного результата,
+  неизменности terminal и сравнения полей при искусственно равном hash.
+- `test_barrier_credentials`: отсутствие/credential другого provider даёт 401.
+- `scripts/check_idempotency_runtime.py`: queued duplicates до первого HTTP,
+  конкурентный дубль B, разные PID worker, HTTP calls 1/1 и ledger 0/1.
+- `scripts/check_first_payment_runtime.py`: canonical success/отказы после restart,
+  controls (включая barrier) возвращают 404 в production, логи безопасны.
+
+D5 реализован; D4/D6, автоматическая сверка и DB recovery остаются будущим объёмом.
+Низкоуровневые DB-проверки дополняют финансовые e2e, не подменяют их.

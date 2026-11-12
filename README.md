@@ -1,7 +1,7 @@
 # Cascade Payments
 
 Последовательный каскад: POST → PostgreSQL/outbox → Redis/Taskiq → worker →
-HTTP mock A/B → GET с историей попыток. Доступны JWT, базовая идемпотентность,
+HTTP mock A/B → GET с историей попыток. Доступны JWT, конкурентная идемпотентность,
 устойчивые отказы и независимые ledger mock A/B. Автоматическая сверка unknown
 и DB recovery ещё не реализованы. Реальные деньги не используются.
 
@@ -51,7 +51,7 @@ volume; `docker compose down` тоже сохраняет его. Не испо�
 
 API: Gunicorn запускает два `uvicorn_worker.UvicornWorker` без preload. Каждый
 процесс создаёт engine/pool в FastAPI lifespan и освобождает при остановке.
-Worker Taskiq и dispatcher — отдельные процессы того же образа; dispatcher публикует неопубликованный outbox с ограниченным timeout, затем отмечает published_at. Сессия SQLAlchemy создаётся отдельно для будущей единицы работы
+Taskiq запускает два независимых worker-процесса (по одной активной async-задаче); dispatcher — отдельный процесс того же образа; dispatcher публикует неопубликованный outbox с ограниченным timeout, затем отмечает published_at. Сессия SQLAlchemy создаётся отдельно для будущей единицы работы
 (UoW — одной операции с общей транзакцией), общих глобальных сессий нет.
 Ready проверяет PostgreSQL и Redis; live — только процесс. Mock для ready API
 не требуются. Порты опубликованы только на loopback.
@@ -183,3 +183,46 @@ Fixtures success/declined_retryable/declined_terminal/not_charged_final выби
 старые финальные операции неизменны. Счётчики HTTP-вызовов и ledger независимы.
 Обновление существующего окружения требует новой mock-миграции на обеих БД
 (команды migrate-mock-a/migrate-mock-b выше); старая история сохранена.
+
+
+## Конкуренция и повторная доставка (D5)
+
+```sh
+docker compose --profile demo run --rm demo duplicate-delivery
+```
+
+Десять конкурентных клиентских POST дают 202 и один payment UUID. Пока HTTP A
+остановлен после provider commit, CLI отправляет три повторных Taskiq-задачи и
+ждёт ACK хотя бы одной из них при всё ещё открытом HTTP. Затем явно освобождает
+barrier, проверяет succeeded, одну attempt, повтор terminal и ledger A=1/123,
+B calls=0. HTTP A остаётся один. Два worker-процесса нужны для воспроизведения
+конкуренции; наличие нескольких процессов само по себе не является финансовой
+гарантией. Схема и claim защищают данные независимо от процесса.
+
+Mock barrier доступен только с соответствующим provider credential в test/demo:
+fixture barrier=before_charge_commit или after_charge_commit_before_response,
+GET /__test/barriers/{key}, POST /__test/barriers/{key}/release с `{}`.
+Обе точки ждут без открытой транзакции, состояние переживает restart mock.
+Ожидание ограничено 30 с; тест ждёт reached=true и освобождает в finally.
+Реализованы только синхронизация и ранее доступные fixtures, без новых fault modes.
+
+Дополнительные host-only проверки (запускать **последовательно**, отдельно от pytest):
+
+```sh
+poetry run python scripts/check_idempotency_runtime.py
+poetry run python scripts/check_first_payment_runtime.py
+```
+
+Первый скрипт останавливает только worker текущего Compose проекта, ставит дубли
+до HTTP, запускает worker, проверяет конкурентный дубль во время B HTTP и разные
+PID обработчиков. Всегда возвращает worker в healthy. Второй проверяет restart
+mock с сохранённой БД, устойчивые финалы, production controls и безопасные логи.
+Volumes не удаляются. Результаты — в docs/verification.md.
+
+Клиентский ключ живёт в scope merchant весь срок данных. Hash не заменяет сравнение
+нормализованных полей; одинаковый key у разных merchant создаёт разные платежи.
+ON CONFLICT DO NOTHING при READ COMMITTED и отдельный SELECT читают победителя
+без искусственного исключения/rollback. Переход к другому уровню изоляции требует
+пересмотра этого протокола. Provider key — сохранённый UUID попытки; HTTP-повторы
+могут увеличить create_calls, но не ledger. Provider idempotency защищает операцию,
+а claim/lease/version координируют worker и защищают локальное состояние.
